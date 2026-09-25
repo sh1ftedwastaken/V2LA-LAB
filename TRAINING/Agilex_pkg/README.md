@@ -28,6 +28,7 @@ cd /home/agilex/limo_code_StutiRuparel/bev2
 > **NOTE:** Ensure to source ROS 2 workspace in **every** terminal before running the commands:
 >```bash
 >source ~/limo_code_StutiRuparel/install/setup.bash
+>source ~/opt/ros/foxy/setup.bash
 >```
 
 
@@ -36,14 +37,16 @@ In Terminals 1, 2, and 3, start the robot's base chassis, depth camera, and LiDA
 ```bash
 # Terminal 1:
 source ~/limo_code_StutiRuparel/install/setup.bash
+source ~/opt/ros/foxy/setup.bash
 ros2 launch limo_base limo_base.launch.py
 
 #Terminal 2: 
 source ~/limo_code_StutiRuparel/install/setup.bash
+source ~/opt/ros/foxy/setup.bash
 ros2 launch orbbec_camera dabai_dcw2.launch.py
 
 # Terminal 3: 
-source ~/limo_code_StutiRuparel/install/setup.bash
+source ~/opt/ros/foxy/setup.bash
 source ~/limo_code_StutiRuparel/src/install/setup.bash
 ros2 launch ydlidar_ros2_driver ydlidar_launch.py
 ```
@@ -53,6 +56,7 @@ In Terminal 4, launch the segmentation node. Point the `checkpoint` parameter to
 
 ```bash
 source ~/limo_code_StutiRuparel/install/setup.bash
+source ~/opt/ros/foxy/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/limo_segmentation_node.py \
 --ros-args \
 -p checkpoint:=/home/agilex/limo_code_StutiRuparel/checkpoints/best_resnet34_unet_jaccard.pth \
@@ -71,6 +75,7 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/limo_segmentation_node.py \
 In Terminal 5, run the BEV projection node. You can leave `calibrate_mode:=True` on if you need to debug the source points:
 ```bash
 source ~/limo_code_StutiRuparel/install/setup.bash
+source ~/opt/ros/foxy/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/seg_bev_node.py \
 --ros-args \
 -p mask_topic:=/seg/mask_raw \
@@ -86,11 +91,13 @@ To monitor what the robot sees and how it calculates lanes, open two visualizati
 **Terminal 6 (RQT Viewer):**
 ```bash
 source ~/limo_code_StutiRuparel/install/setup.bash
+source ~/opt/ros/foxy/setup.bash
 ros2 run rqt_image_view rqt_image_view
 ```
 **Terminal 7 (Custom Viewer - All combined):**
 ```bash
 source ~/limo_code_StutiRuparel/install/setup.bash
+source ~/opt/ros/foxy/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/debug_visualizer.py
 ```
 
@@ -101,6 +108,7 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/debug_visualizer.py
 In Terminal 8, activate the main driving script to start moving. You can adjust the top speed using the `max_speed` parameter:
 ```bash
 source ~/limo_code_StutiRuparel/install/setup.bash
+source ~/opt/ros/foxy/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/autonomous_driving.py \
 --ros-args \
 -p max_speed:=0.25

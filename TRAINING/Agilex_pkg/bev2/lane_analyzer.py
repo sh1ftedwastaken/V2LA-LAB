@@ -42,7 +42,7 @@ CLASS_VEHICLE = 4
 # LANE ANALYSIS DEFAULTS
 # =========================================================
 
-DEFAULT_LANE_WIDTH_PX = 55.0
+DEFAULT_LANE_WIDTH_PX = 128.0
 
 MIN_POLYFIT_POINTS = 30
 MIN_OBSTACLE_AREA_PX = 8
@@ -589,6 +589,21 @@ class LaneAnalyzer:
         points[:, 1] += float(offset_px) * normal_y
 
         return points
+    
+    def _is_path_straight(self, path_points: np.ndarray, threshold: float = 4.5) -> bool:
+        """Check if a path is mathematically straight by measuring its bow distance."""
+        if path_points is None or len(path_points) < 3:
+            return True
+            
+        start_pt = path_points[0]
+        end_pt = path_points[-1]
+        mid_idx = len(path_points) // 2
+        actual_mid_pt = path_points[mid_idx]
+        
+        straight_mid_pt = (start_pt + end_pt) / 2.0
+        bow_distance = float(np.linalg.norm(actual_mid_pt - straight_mid_pt))
+        
+        return bow_distance < threshold
 
     def update_lane_width(
         self,
@@ -607,6 +622,9 @@ class LaneAnalyzer:
             + (1.0 - self.alpha_lane_width)
             * float(self.lane_width_px)
         )
+        
+        # --- NEW: Debug print for manual physical measurement comparison ---
+        print(f"[LaneAnalyzer] Detected anchor gap: {measured_width:.2f} px | Updated EMA Lane Width: {self.lane_width_px:.2f} px")
 
     # -----------------------------------------------------
     # Public API
@@ -650,7 +668,7 @@ class LaneAnalyzer:
 
         ego_center = float(w / 2.0)
         half_lane = float(self.lane_width_px) / 2.0
-        single_line_half_lane = half_lane * 0.87
+        # single_line_half_lane = half_lane * 0.87    # REMOVE FOR NOW
 
 
         # -------------------------------------------------
@@ -726,152 +744,94 @@ class LaneAnalyzer:
         ]
 
         right_candidates = [
-            candidate for candidate in candidates if candidate.side == "right" ############################## RESUME FROM HERE
+            candidate for candidate in candidates if candidate.side == "right"
         ]
-
+        
         # -------------------------------------------------
-        # 4. Solve the centerline using left/right geometry.
+        # 4. Evaluate Straightness & Solve Centerline
         # -------------------------------------------------
-
         center_path = None
         center_y_min = y0
         center_y_max = y1 - 1
         state = STATE_LOST
-        multiplier = 1.0
+        tune_offset_px = 0.0
 
-        if left_candidates and right_candidates:
-            # With the current two-color pipeline, normally only one
-            # candidate exists per side. These selectors remain safe if
-            # additional candidates are introduced later.
-            left_candidate = max(
-                left_candidates,
-                key=self._candidate_strength,
-            )
+        # Step A: Decide if the road is straight using the strongest visible boundary
+        is_straight = True
+        if candidates:
+            strongest_candidate = max(candidates, key=self._candidate_strength)
+            is_straight = self._is_path_straight(strongest_candidate.fit.path_points)
 
-            right_candidate = max(
-                right_candidates,
-                key=self._candidate_strength,
-            )
+        # Step B: Straight Road Logic (Use both lines if available)
+        if is_straight and left_candidates and right_candidates:
+            left_candidate = max(left_candidates, key=self._candidate_strength)
+            right_candidate = max(right_candidates, key=self._candidate_strength)
 
-            anchor_gap = (
-                right_candidate.anchor_x
-                - left_candidate.anchor_x
-            )
+            anchor_gap = (right_candidate.anchor_x - left_candidate.anchor_x)
 
             if anchor_gap >= MIN_BOTH_LANE_GAP_PX:
                 left_fit = left_candidate.fit
                 right_fit = right_candidate.fit
 
-                center_path = self._average_lane_paths(
-                    left_fit,
-                    right_fit,
-                )
+                center_path = self._average_lane_paths(left_fit, right_fit)
 
-                center_y_min = max(
-                    left_fit.y_min,
-                    right_fit.y_min,
-                )
-                center_y_max = min(
-                    left_fit.y_max,
-                    right_fit.y_max,
-                )
+                center_y_min = max(left_fit.y_min, right_fit.y_min)
+                center_y_max = min(left_fit.y_max, right_fit.y_max)
 
                 if center_y_min > center_y_max:
-                    center_y_min = min(
-                        left_fit.y_min,
-                        right_fit.y_min,
-                    )
-                    center_y_max = max(
-                        left_fit.y_max,
-                        right_fit.y_max,
-                    )
+                    center_y_min = min(left_fit.y_min, right_fit.y_min)
+                    center_y_max = max(left_fit.y_max, right_fit.y_max)
 
-                # Update width only from boundaries that physically
-                # bracket the robot.
+                # Update the dynamic track width ONLY on straightaways
                 self.update_lane_width(anchor_gap)
 
                 state = STATE_BOTH
-                multiplier = 1.0
-
+                
+        # Step C: Curve Logic or Single-Line Logic
         if center_path is None and candidates:
-            # This covers:
-            # - only one visible physical boundary,
-            # - two color fits classified on the same side,
-            # - two opposite candidates whose gap is implausibly small.
-            #
-            # Keep the strongest/cleanest candidate. Color is irrelevant.
-            selected = max(
-                candidates,
-                key=self._candidate_strength,
-            )
-
+            # Trust the strongest line
+            selected = max(candidates, key=self._candidate_strength)
             selected_fit = selected.fit
 
+            # 1. DRAW PURE GEOMETRIC CENTER (Always exactly 1.0 * half_lane)
+            # This ensures the blue line is always visually perfect in the BEV image
             if selected.side == "left":
-                # Shift the left boundary right into its lane.
-                center_path = self._shift_lane_path(
-                    selected_fit,
-                    +single_line_half_lane,
-                )
+                center_path = self._shift_lane_path(selected_fit, +half_lane)
                 state = STATE_LEFT_ONLY
-                multiplier = 1.0
-
             else:
-                # Shift the right boundary left into its lane.
-                center_path = self._shift_lane_path(
-                    selected_fit,
-                    -single_line_half_lane,
-                )
+                center_path = self._shift_lane_path(selected_fit, -half_lane)
                 state = STATE_RIGHT_ONLY
-                multiplier = -1.0
 
+            # 2. CALCULATE CONTROL TUNING OFFSET
+            if selected.color_name == "yellow":
+                tune_offset_px = (+0.40 * half_lane + 25) if selected.side == "left" else (-0.40 * half_lane - 25)
+            else:
+                tune_offset_px = (-0.35 * half_lane) if selected.side == "right" else (+0.35 * half_lane)
+                
             center_y_min = selected_fit.y_min
             center_y_max = selected_fit.y_max
 
         # -------------------------------------------------
         # 5. Conservative drivable-area fallback.
         # -------------------------------------------------
-
         if center_path is None:
-            road_ys, road_xs = np.where(
-                roi == CLASS_ROAD
-            )
+            road_ys, road_xs = np.where(roi == CLASS_ROAD)
 
             if road_xs.size > 50:
                 median_x = float(np.median(road_xs))
-
-                center_path = np.column_stack(
-                    (
-                        np.full(
-                            50,
-                            median_x,
-                            dtype=np.float64,
-                        ),
-                        np.linspace(
-                            center_y_max,
-                            center_y_min,
-                            50,
-                            dtype=np.float64,
-                        ),
-                    )
-                )
-
+                center_path = np.column_stack((
+                    np.full(50, median_x, dtype=np.float64),
+                    np.linspace(center_y_max, center_y_min, 50, dtype=np.float64),
+                ))
                 state = STATE_DRIVABLE
-                multiplier = 1.0
-        
+
         # -------------------------------------------------
         # 6. Prevent path from extrapolating beyond visible road
         # -------------------------------------------------
         if center_path is not None and len(center_path) > 0:
-            # Instead of checking mask color, we mathematically cut off the 
-            # path so it doesn't extend higher than the furthest observed lane point.
-            # (Note: In image coordinates, a smaller Y means higher up the screen)
             valid_idx = center_path[:, 1] >= (center_y_min - 10) 
-            
-            # Keep only the valid points
             center_path = center_path[valid_idx]
             
-            # If the path is too short, mark it as lost
             if len(center_path) < 2:
                 center_path = None
 
@@ -882,7 +842,7 @@ class LaneAnalyzer:
             center_y_min,
             center_y_max,
             state,
-            multiplier,
+            tune_offset_px,
         )
 
 

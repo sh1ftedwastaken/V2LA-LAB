@@ -3,6 +3,7 @@ TERMINAL 1,2,3:
 
 TERMINAL 4: 
 source ~/limo_code_StutiRuparel/install/setup.bash
+source /opt/ros/foxy/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/limo_segmentation_node.py \
 --ros-args \
 -p checkpoint:=/home/agilex/limo_code_StutiRuparel/checkpoints/best_resnet34_unet_jaccard.pth \
@@ -19,6 +20,7 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/limo_segmentation_node.py \
 
 TERMINAL 5:
 source ~/limo_code_StutiRuparel/install/setup.bash
+source /opt/ros/foxy/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/seg_bev_node.py \
 --ros-args \
 -p mask_topic:=/seg/mask_raw \
@@ -32,16 +34,19 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/seg_bev_node.py \
 
 TERMINAL 6:
 source ~/limo_code_StutiRuparel/install/setup.bash
+source /opt/ros/foxy/setup.bash
 ros2 run rqt_image_view rqt_image_view
 
 
 TERMINAL 7:
 source ~/limo_code_StutiRuparel/install/setup.bash
+source /opt/ros/foxy/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/debug_visualizer.py
 
 
 TERMINAL 8:
 source ~/limo_code_StutiRuparel/install/setup.bash
+source /opt/ros/foxy/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/autonomous_driving.py \
 --ros-args \
 -p max_speed:=0.25
@@ -51,14 +56,17 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/autonomous_driving.py \
 ## EXTRA:
 TERMINAL: (change bev src and dst points in real time)
 source ~/limo_code_StutiRuparel/install/setup.bash
+source /opt/ros/foxy/setup.bash
 ros2 param set /seg_bev_node bev_src_top_left_x 64
 
 TERMINAL:
 source ~/limo_code_StutiRuparel/install/setup.bash
+source /opt/ros/foxy/setup.bash
 python3 ~/limo_code_StutiRuparel/src/limo_camera_pkg/limo_camera_pkg/four_wheel_diff_controller_v3.py
 
 TERMINAL: 
 source ~/limo_code_StutiRuparel/install/setup.bash
+source /opt/ros/foxy/setup.bash
 python3 ~/limo_code_StutiRuparel/src/limo_camera_pkg/limo_camera_pkg/limo_teleop_key.py \
     --ros-args -p drive_mode:=diff \
     -p cmd_topic:=/cmd_vel \

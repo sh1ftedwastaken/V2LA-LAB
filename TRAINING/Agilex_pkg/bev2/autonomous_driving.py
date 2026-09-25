@@ -384,7 +384,7 @@ class Driver(Node):
         # Shared lane analysis
         # ---------------------------------------------
 
-        _, _, center_path, _, _, state, multiplier = self.lane_analyzer.analyze(mask)
+        _, _, center_path, _, _, state, tune_offset_px = self.lane_analyzer.analyze(mask)
 
         path_valid = (center_path is not None and len(center_path) >= 2 and np.isfinite(center_path).all())
 
@@ -417,17 +417,11 @@ class Driver(Node):
         # ---------------------------------------------
         # Steering calculation
         # ---------------------------------------------
-        
-        # Check if the path is straight by comparing the actual midpoint of the path to the midpoint of a straight line between the start and end points.
-        actual_mid_pt = center_path[len(center_path) // 2]
-        straight_mid_pt = (center_path[0] + center_path[-1]) / 2.0
-        bow_distance = np.linalg.norm(actual_mid_pt - straight_mid_pt)
-        is_straight = bow_distance < 4.5
-
-        if state == STATE_BOTH or is_straight:
+        if state == STATE_BOTH:
             desired_center = width / 2.0
         else:
-            desired_center = (width / 2.0 + self.center_offset_px * multiplier)
+            # Apply the tuning offset directly to the target center
+            desired_center = (width / 2.0) + tune_offset_px
 
         raw_error = desired_center - center_x
         smoothed_error = self.error_filter.filter(raw_error)
