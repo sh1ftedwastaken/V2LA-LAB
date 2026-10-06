@@ -42,7 +42,7 @@ CLASS_VEHICLE = 4
 # LANE ANALYSIS DEFAULTS
 # =========================================================
 
-DEFAULT_LANE_WIDTH_PX = 128.0
+DEFAULT_LANE_WIDTH_PX = 100
 
 MIN_POLYFIT_POINTS = 30
 MIN_OBSTACLE_AREA_PX = 8
@@ -590,7 +590,7 @@ class LaneAnalyzer:
 
         return points
     
-    def _is_path_straight(self, path_points: np.ndarray, threshold: float = 4.5) -> bool:
+    def _is_path_straight(self, path_points: np.ndarray, threshold: float = 3.0) -> bool:
         """Check if a path is mathematically straight by measuring its bow distance."""
         if path_points is None or len(path_points) < 3:
             return True
@@ -624,7 +624,7 @@ class LaneAnalyzer:
         )
         
         # --- NEW: Debug print for manual physical measurement comparison ---
-        print(f"[LaneAnalyzer] Detected anchor gap: {measured_width:.2f} px | Updated EMA Lane Width: {self.lane_width_px:.2f} px")
+        # print(f"[LaneAnalyzer] Detected anchor gap: {measured_width:.2f} px | Updated EMA Lane Width: {self.lane_width_px:.2f} px")
 
     # -----------------------------------------------------
     # Public API
@@ -761,9 +761,10 @@ class LaneAnalyzer:
         if candidates:
             strongest_candidate = max(candidates, key=self._candidate_strength)
             is_straight = self._is_path_straight(strongest_candidate.fit.path_points)
-
+            # print(f"{is_straight=}")
+	
         # Step B: Straight Road Logic (Use both lines if available)
-        if is_straight and left_candidates and right_candidates:
+        if left_candidates and right_candidates:
             left_candidate = max(left_candidates, key=self._candidate_strength)
             right_candidate = max(right_candidates, key=self._candidate_strength)
 
@@ -773,10 +774,60 @@ class LaneAnalyzer:
                 left_fit = left_candidate.fit
                 right_fit = right_candidate.fit
 
-                center_path = self._average_lane_paths(left_fit, right_fit)
+                # 1. Calculate the standard average path
+                avg_path = self._average_lane_paths(left_fit, right_fit)
 
-                center_y_min = max(left_fit.y_min, right_fit.y_min)
-                center_y_max = min(left_fit.y_max, right_fit.y_max)
+                # 2. Find which line extends further ahead into the curve (smaller y_min)
+                if left_fit.y_min < right_fit.y_min:
+                    longer_candidate = left_candidate
+                else:
+                    longer_candidate = right_candidate
+
+                # 3. Calculate the shifted path for that longer line
+                if longer_candidate.side == "left":
+                    single_path = self._shift_lane_path(longer_candidate.fit, +half_lane)
+                else:
+                    single_path = self._shift_lane_path(longer_candidate.fit, -half_lane)
+
+                # 4. Stitch them together with a smooth blend! 
+                # The shared visible area ends where the shorter line ends.
+                shared_y_min = max(left_fit.y_min, right_fit.y_min)
+                
+                # Find the exact waypoint index where the switch happens
+                transition_idx = -1
+                for i in range(len(avg_path)):
+                    if avg_path[i, 1] < shared_y_min:
+                        transition_idx = i
+                        break
+                        
+                center_path = np.zeros_like(avg_path)
+                
+                # Number of waypoints to smooth on each side of the cut (total 30 points)
+                blend_radius = 15  
+                
+                for i in range(len(avg_path)):
+                    # If we are inside the blending window, smoothly transition between the two paths
+                    if transition_idx != -1 and (transition_idx - blend_radius) <= i <= (transition_idx + blend_radius):
+                        start = transition_idx - blend_radius
+                        end = transition_idx + blend_radius
+                        
+                        # Alpha calculates the weight: 1.0 (pure avg) smoothly down to 0.0 (pure single)
+                        alpha = float(end - i) / float(end - start)
+                        
+                        center_path[i, 0] = (alpha * avg_path[i, 0]) + ((1.0 - alpha) * single_path[i, 0])
+                        center_path[i, 1] = (alpha * avg_path[i, 1]) + ((1.0 - alpha) * single_path[i, 1])
+                        
+                    # Before the blend window: Use the standard average path
+                    elif avg_path[i, 1] >= shared_y_min:
+                        center_path[i] = avg_path[i]
+                        
+                    # After the blend window: Use the single shifted path
+                    else:
+                        center_path[i] = single_path[i]
+
+                # Expand the visual boundary to include the extended single line
+                center_y_min = min(left_fit.y_min, right_fit.y_min)
+                center_y_max = max(left_fit.y_max, right_fit.y_max)
 
                 if center_y_min > center_y_max:
                     center_y_min = min(left_fit.y_min, right_fit.y_min)
@@ -786,15 +837,28 @@ class LaneAnalyzer:
                 self.update_lane_width(anchor_gap)
 
                 state = STATE_BOTH
-                
+                tune_offset_px = 0.0
+                    
         # Step C: Curve Logic or Single-Line Logic
         if center_path is None and candidates:
-            # Trust the strongest line
+            # We are in a curve OR only one line is visible. 
+            # Trust the strongest line.
             selected = max(candidates, key=self._candidate_strength)
             selected_fit = selected.fit
 
-            # 1. DRAW PURE GEOMETRIC CENTER (Always exactly 1.0 * half_lane)
-            # This ensures the blue line is always visually perfect in the BEV image
+            # --- NEW UNIFIED LOGIC: Handle straight single-lines vs curved single-lines ---
+            if is_straight:
+                # The car is exiting a curve and sees a straight line, or is on a straightaway 
+                # missing a line. Use the previously learned true track width without curve modifiers.
+                tune_offset_px = 0.0
+            else:
+                # The line is curved. Tie physical width directly to color.
+                if selected.color_name == "yellow":
+                    tune_offset_px = (+0.50 * half_lane + 25) if selected.side == "left" else (-0.50 * half_lane - 25)
+                else:
+                    tune_offset_px = (-0.75 * half_lane) if selected.side == "right" else (+0.75 * half_lane)
+            # -------------------------------------------------------------------------------
+
             if selected.side == "left":
                 center_path = self._shift_lane_path(selected_fit, +half_lane)
                 state = STATE_LEFT_ONLY
@@ -802,12 +866,6 @@ class LaneAnalyzer:
                 center_path = self._shift_lane_path(selected_fit, -half_lane)
                 state = STATE_RIGHT_ONLY
 
-            # 2. CALCULATE CONTROL TUNING OFFSET
-            if selected.color_name == "yellow":
-                tune_offset_px = (+0.40 * half_lane + 25) if selected.side == "left" else (-0.40 * half_lane - 25)
-            else:
-                tune_offset_px = (-0.35 * half_lane) if selected.side == "right" else (+0.35 * half_lane)
-                
             center_y_min = selected_fit.y_min
             center_y_max = selected_fit.y_max
 

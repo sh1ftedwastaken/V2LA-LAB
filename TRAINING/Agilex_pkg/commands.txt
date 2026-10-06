@@ -28,8 +28,8 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/seg_bev_node.py \
 -p bev_size:=160 \
 -p mask_width:=160 \
 -p mask_height:=120 \
-
--p calibrate_mode:=True         # For debugging purposes only 
+-p calibrate_mode:=True \
+-p debug_mode:=True
 
 
 TERMINAL 6:

@@ -27,6 +27,8 @@ from sensor_msgs.msg import Image, LaserScan
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 
+from scipy.optimize import minimize
+
 from lane_analyzer import (
     LaneAnalyzer,
     STATE_BOTH,
@@ -56,7 +58,6 @@ STATE_RETURNING = "RETURNING"
 # =========================================================
 
 DEFAULT_MAX_SPEED = 0.25
-DEFAULT_CENTER_OFFSET_PX = 30
 
 # Fixed controller target. For a 160-pixel BEV:
 # 0.82 * 159 ~= 130 pixels.
@@ -152,7 +153,6 @@ class Driver(Node):
 
         self.declare_parameter("default_lane_width", DEFAULT_LANE_WIDTH_PX)
         self.declare_parameter("max_speed", DEFAULT_MAX_SPEED)
-        self.declare_parameter("center_offset_px", DEFAULT_CENTER_OFFSET_PX)
         self.declare_parameter("roi_start_ratio", DEFAULT_ROI_START_RATIO)
         self.declare_parameter("roi_end_ratio", DEFAULT_ROI_END_RATIO)
         self.declare_parameter("control_target_y_ratio", DEFAULT_CONTROL_TARGET_Y_RATIO)
@@ -162,7 +162,6 @@ class Driver(Node):
         self.declare_parameter("safety_stop_distance", DEFAULT_SAFETY_STOP_DISTANCE_M)
         default_lane_width = float(self.get_parameter("default_lane_width").value)
         self.max_speed = max(0.0, float(self.get_parameter("max_speed").value))
-        self.center_offset_px = float(self.get_parameter("center_offset_px").value)
         roi_start_ratio = float(self.get_parameter("roi_start_ratio").value)
         roi_end_ratio = float(self.get_parameter("roi_end_ratio").value)
         self.control_target_y_ratio = float(np.clip(self.get_parameter("control_target_y_ratio").value, 0.0, 1.0,))
@@ -384,7 +383,7 @@ class Driver(Node):
         # Shared lane analysis
         # ---------------------------------------------
 
-        _, _, center_path, _, _, state, tune_offset_px = self.lane_analyzer.analyze(mask)
+        _, _, center_path, center_y_min, center_y_max, state, tune_offset_px = self.lane_analyzer.analyze(mask)
 
         path_valid = (center_path is not None and len(center_path) >= 2 and np.isfinite(center_path).all())
 
@@ -393,10 +392,16 @@ class Driver(Node):
             return
 
         # ---------------------------------------------
-        # Fixed lookahead control
+        # Dynamic lookahead control
         # ---------------------------------------------
-
-        target_y = (self.control_target_y_ratio * float(height - 1))
+        
+        # Calculate how far up the screen the path is visible (0.0 is top, 1.0 is bottom)
+        visible_ratio = float(center_y_min) / float(height)
+        
+        # Target a safe distance (e.g., 25% of the screen) below the furthest visible point.
+        # Clip it between 0.65 (fast straightaways) and 0.88 (sharp curves near the bumper).
+        dynamic_target_ratio = np.clip(visible_ratio + 0.10, 0.95, 0.99)        
+        target_y = dynamic_target_ratio * float(height - 1)
         distances = np.abs(center_path[:, 1] - target_y)
         closest_index = int(np.argmin(distances))
         center_x = float(center_path[closest_index, 0])

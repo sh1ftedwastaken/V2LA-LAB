@@ -63,25 +63,27 @@ class SegBEVNode(Node):
         self.declare_parameter("mask_width", 160)
         self.declare_parameter("mask_height", 120)
         self.declare_parameter("default_lane_width", DEFAULT_LANE_WIDTH_PX)
-        self.declare_parameter("camera_offset_x_px", 5.0)
+        self.declare_parameter("camera_offset_x_px", 0.0)
         self.declare_parameter("roi_start_ratio", DEFAULT_ROI_START_RATIO)
         self.declare_parameter("roi_end_ratio", DEFAULT_ROI_END_RATIO)
         self.declare_parameter("calibrate_mode", False)
+        self.declare_parameter("debug_mode", False)
+
         
         # BEV Source Parameters
-        self.declare_parameter("bev_src_bottom_left_x", 8.0)
-        self.declare_parameter("bev_src_bottom_left_y", 118.0)  
-        self.declare_parameter("bev_src_bottom_right_x", 152.0) 
-        self.declare_parameter("bev_src_bottom_right_y", 118.0) 
-        self.declare_parameter("bev_src_top_right_x", 120.0)    
-        self.declare_parameter("bev_src_top_right_y", 80.0)   
-        self.declare_parameter("bev_src_top_left_x", 30.0)  
-        self.declare_parameter("bev_src_top_left_y", 80.0)    
+        self.declare_parameter("bev_src_bottom_left_x", 10)       # 15
+        self.declare_parameter("bev_src_bottom_left_y", 120.0)      # 240   
+        self.declare_parameter("bev_src_bottom_right_x", 155.5)     # 315
+        self.declare_parameter("bev_src_bottom_right_y", 120.0)     # 240
+        self.declare_parameter("bev_src_top_right_x", 108)        # 215
+        self.declare_parameter("bev_src_top_right_y", 80.0)        # 160
+        self.declare_parameter("bev_src_top_left_x", 56.0)         # 100
+        self.declare_parameter("bev_src_top_left_y", 80.0)         # 160
         
         # BEV Destination Parameters (Margin-based)
         self.declare_parameter("bev_dst_margin_x", 20.0)
         self.declare_parameter("bev_dst_top_y", 5.0)
-        self.declare_parameter("bev_dst_bottom_y", 155.0)
+        self.declare_parameter("bev_dst_bottom_y", 162)
         
         # Parameters for lane analysis and overlay
         self.bev_size           = self.get_parameter("bev_size").value
@@ -92,7 +94,8 @@ class SegBEVNode(Node):
         self.camera_offset_x_px = self.get_parameter("camera_offset_x_px").value
         self.lane_width_px      = self.get_parameter("default_lane_width").value
         self.roi_start_ratio    = self.get_parameter("roi_start_ratio").value
-        self.roi_end_ratio      = self.get_parameter("roi_end_ratio").value   
+        self.roi_end_ratio      = self.get_parameter("roi_end_ratio").value
+        self.debug_mode = self.get_parameter("debug_mode").value
         
         with open(params_path, "r", encoding="utf-8") as handle:
             cam = yaml.safe_load(handle)  
@@ -124,6 +127,7 @@ class SegBEVNode(Node):
         self.pub_bev      = self.create_publisher(Image, "/seg/bev", 10)
         self.pub_overlay  = self.create_publisher(Image, "/seg/bev_overlay", 10)  
         self.pub_bev_grid = self.create_publisher(Image, "/seg/bev_grid", 10)
+        self.pub_bev_debug = self.create_publisher(Image, "/seg/bev_debug", 10)
         
         self.get_logger().info(f"Subscribed to mask topic: {mask_topic}")
         self.get_logger().info(f"Expected mask size     : {self.mask_w}x{self.mask_h}")
@@ -200,7 +204,7 @@ class SegBEVNode(Node):
             bev_size=(self.bev_size, self.bev_size)
         )
         bev_clean = cleanup_bev(bev_mask)  
-        
+                   
         bev_msg        = self.bridge.cv2_to_imgmsg(bev_clean, encoding="mono8")
         bev_msg.header = msg.header
         self.pub_bev_mask.publish(bev_msg)  
@@ -220,7 +224,37 @@ class SegBEVNode(Node):
         )
         overlay_msg = self.bridge.cv2_to_imgmsg(overlay, encoding="bgr8")
         overlay_msg.header = msg.header
-        self.pub_overlay.publish(overlay_msg)  
+        self.pub_overlay.publish(overlay_msg)
+        
+        # --- DEBUG CALCULATION ---
+        if self.debug_mode:
+            # Make a copy of the overlay that already has the fitted lines
+            debug_img = overlay.copy()
+            h, w = debug_img.shape[:2]
+
+            # 1. Draw the Static ROI Bounds (Red & Blue)
+            y0 = int(round(h * self.roi_start_ratio))
+            y1 = int(round(h * self.roi_end_ratio))
+            y0 = max(0, min(h - 1, y0))
+            y1 = max(y0 + 1, min(h, y1))
+
+            cv2.line(debug_img, (0, y0), (w, y0), (0, 0, 255), 2)  # ROI Start (Red)
+            cv2.line(debug_img, (0, y1), (w, y1), (255, 0, 0), 2)  # ROI End (Blue)
+
+            _, _, _, center_y_min, _, _, _ = self.analyzer.analyze(bev_mask)
+
+            # 3. Calculate and Draw the Dynamic Lookahead Target (Green)
+            visible_ratio = float(center_y_min) / float(h)
+            dynamic_target_ratio = np.clip(visible_ratio + 0.10, 0.95, 0.99)
+            target_y_px = int(round(dynamic_target_ratio * float(h - 1)))
+            
+            # Draw a bright green line for the dynamic target
+            cv2.line(debug_img, (0, target_y_px), (w, target_y_px), (0, 0, 0), 2)
+
+            # Convert to ROS Image message and publish
+            debug_msg = self.bridge.cv2_to_imgmsg(debug_img, encoding="bgr8")
+            debug_msg.header = msg.header
+            self.pub_bev_debug.publish(debug_msg)
         
         self._frames += 1
         if self._frames == 1:
