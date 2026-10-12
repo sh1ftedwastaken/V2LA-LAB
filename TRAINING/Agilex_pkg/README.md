@@ -1,6 +1,6 @@
 # Autonomous Driving Pipeline
 
-This repository contains a ROS 2 based autonomous driving pipeline for vision-based lane following and obstacle avoidance. The system uses a deep learning segmentation model to identify roads, lanes, and vehicles, warps the camera view into a Bird's Eye View (BEV), and calculates real-time driving commands.
+This repository contains a ROS 2 based autonomous driving pipeline for vision-based lane following and obstacle avoidance. The system uses a deep learning segmentation model to identify roads, lanes, and vehicles, warps the camera view into a Bird's Eye View (BEV), and calculates real-time driving commands using Model Predictive Control (MPC).
 
 ## System Architecture
 
@@ -75,7 +75,7 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/limo_segmentation_node.py \
 In Terminal 5, run the BEV projection node. You can leave `calibrate_mode:=True` on if you need to debug the source points:
 ```bash
 source ~/limo_code_StutiRuparel/install/setup.bash
-source ~/opt/ros/foxy/setup.bash
+source /opt/ros/foxy/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/seg_bev_node.py \
 --ros-args \
 -p mask_topic:=/seg/mask_raw \
@@ -83,7 +83,8 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/seg_bev_node.py \
 -p bev_size:=160 \
 -p mask_width:=160 \
 -p mask_height:=120 \
--p calibrate_mode:=True         # (OPTIONAL) Keep for debugging
+-p calibrate_mode:=True \ 
+-p debug_mode:=True         # OPTIONAL Keep for debugging (calibrate_mode and debug_mode)
 ``` 
 
 ### 4. Visualization & Debugging

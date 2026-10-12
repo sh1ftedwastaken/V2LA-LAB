@@ -1,4 +1,3 @@
-TRAINING/Agilex_pkg/bev2_stuti
 **/__pycache__/
 **/.vscode
 TRAINING/Agilex_pkg/.videos/
@@ -6,4 +5,3 @@ TRAINING/data/
 TRAINING/data_old/
 TRAINING/predictions
 TRAINING/Agilex_pkg/robot_outputs
-**/

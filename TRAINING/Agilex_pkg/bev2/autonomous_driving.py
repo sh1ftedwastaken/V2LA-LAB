@@ -18,6 +18,7 @@ This version intentionally implements lane following only:
 from __future__ import annotations
 
 import numpy as np
+import cv2
 
 import rclpy
 from rclpy.node import Node
@@ -25,6 +26,7 @@ from rclpy.qos import qos_profile_sensor_data
 
 from sensor_msgs.msg import Image, LaserScan
 from geometry_msgs.msg import Twist
+from std_msgs.msg import Float32MultiArray
 from cv_bridge import CvBridge
 
 from scipy.optimize import minimize
@@ -59,10 +61,6 @@ STATE_RETURNING = "RETURNING"
 
 DEFAULT_MAX_SPEED = 0.25
 
-# Fixed controller target. For a 160-pixel BEV:
-# 0.82 * 159 ~= 130 pixels.
-DEFAULT_CONTROL_TARGET_Y_RATIO = 0.82
-
 # Number of temporarily missing frames that may reuse decayed steering.
 DEFAULT_LOST_FRAME_LIMIT = 4
 
@@ -74,67 +72,120 @@ DEFAULT_GRACE_OMEGA_DECAY = 0.70
 DEFAULT_SAFETY_STOP_DISTANCE_M = 0.25
 
 
-# =========================================================
-# LOW-PASS FILTER
-# =========================================================
+class MPCController:
+    """
+    MPC: Optimize a sequence of normalized velocities (v_norm) and steering commands (omega)
+    to minimize the error with respect to the future trajectory (center_path) while maximizing speed.
+    """
+    def __init__(self, N=10, dt=0.1, v_pixel_max=120.0, max_angular=0.45):
+        self.N = N
+        self.dt = dt
+        self.v_pixel_max = v_pixel_max  # Maximum simulated speed in pixels/sec
+        self.max_omega = abs(float(max_angular))
 
-class LowPassFilter:
-    """Simple exponential low-pass filter."""
+        # Weights (Tuning)
+        self.Q = 10.0     # Cost for deviating from the blue line
+        self.R = 10.0    # Control effort (Prevents unnecessary steering) [4]
+        self.Rd = 20.0   # Steering smoothness (Prevents jerky wheel movements)
+        self.Qv = 10.0   # Penalty for going slow (Rewards driving at v_norm = 1.0)
+        self.Rdv = 15.0  # Acceleration smoothness (Prevents sudden braking/accelerating)
 
-    def __init__(self, alpha: float = 0.25):
-        self.alpha = float(np.clip(alpha, 0.0, 1.0))
-        self.initialized = False
-        self.current_value = 0.0
+        # Initial guess: N velocities (default 1.0) + N omegas (default 0.0)
+        self.prev_controls = np.zeros(2 * self.N)
+        self.prev_controls[:self.N] = 1.0  # Start with a guess of max speed
 
-    def filter(self, value: float) -> float:
-        value = float(value)
+    def predict_trajectory(self, x0, y0, theta0, vs_norm, omegas):
+        """Simulate where the car will be using dynamic velocities and steering."""
+        x, y, theta = x0, y0, theta0
+        trajectory = np.zeros((self.N, 2))
+        for i in range(self.N):
+            # Scale the normalized velocity [0.0 to 1.0] to pixel speed
+            v_pixel = vs_norm[i] * self.v_pixel_max
+            x += v_pixel * np.cos(theta) * self.dt
+            y += v_pixel * np.sin(theta) * self.dt
+            theta -= omegas[i] * self.dt
+            trajectory[i] = [x, y]
+        return trajectory
 
-        if not self.initialized:
-            self.current_value = value
-            self.initialized = True
-            return value
+    def cost_function(self, controls, x0, y0, theta0, target_trajectory):
+        """Calculate total cost using perfectly smooth Euclidean distance."""
+        vs_norm = controls[:self.N]
+        omegas = controls[self.N:]
 
-        self.current_value = (
-            self.alpha * value + (1.0 - self.alpha) * self.current_value
+        trajectory = self.predict_trajectory(x0, y0, theta0, vs_norm, omegas)
+        cost = 0.0
+
+        for i in range(self.N):
+            # 1. Smooth Tracking Error (Perfect Parabola, no np.interp failure)
+            # Distance squared between where the car is predicted to be, and the target waypoint
+            dist_sq = (trajectory[i, 0] - target_trajectory[i, 0])**2 + \
+                      (trajectory[i, 1] - target_trajectory[i, 1])**2
+            
+            cost += self.Q * dist_sq
+
+            # 2. Steering effort & smoothness
+            cost += self.R * (omegas[i]**2)
+            if i > 0:
+                cost += self.Rd * ((omegas[i] - omegas[i-1])**2)
+
+            # 3. Velocity reward & smoothness
+            cost += self.Qv * ((1.0 - vs_norm[i])**2)
+            if i > 0:
+                cost += self.Rdv * ((vs_norm[i] - vs_norm[i-1])**2)
+
+        return cost
+
+    def compute(self, x0, y0, theta0, ref_path):
+        """Solve for the optimal velocity and steering commands."""
+        
+        # --- NEW: Pre-calculate N target waypoints along the blue line ---
+        # Calculate the cumulative distance along the blue line
+        diffs = np.diff(ref_path, axis=0)
+        dists = np.linalg.norm(diffs, axis=1)
+        cum_dists = np.zeros(len(ref_path))
+        cum_dists[1:] = np.cumsum(dists)
+
+        target_trajectory = np.zeros((self.N, 2))
+        for i in range(self.N):
+            # Find the point on the blue line that the car SHOULD reach at step i
+            target_dist = (i + 1) * (self.v_pixel_max * self.dt)
+            
+            # Find the closest index on the blue line
+            idx = np.searchsorted(cum_dists, target_dist)
+            if idx >= len(ref_path):
+                idx = len(ref_path) - 1
+                
+            target_trajectory[i] = ref_path[idx]
+        # -----------------------------------------------------------------
+
+        bounds = [(0.2, 1.0) for _ in range(self.N)] + \
+                 [(-self.max_omega, self.max_omega) for _ in range(self.N)]
+
+        result = minimize(
+            self.cost_function,
+            self.prev_controls,
+            args=(x0, y0, theta0, target_trajectory), # Pass the fixed targets here!
+            method='L-BFGS-B',
+            bounds=bounds
         )
 
-        return float(self.current_value)
+        optimal_controls = result.x
 
-    def reset(self) -> None:
-        self.initialized = False
-        self.current_value = 0.0
+        self.prev_controls[:self.N-1] = optimal_controls[1:self.N]
+        self.prev_controls[self.N-1] = optimal_controls[self.N-1]
+        self.prev_controls[self.N:2*self.N-1] = optimal_controls[self.N+1:]
+        self.prev_controls[-1] = optimal_controls[-1]
 
+        best_v_norm = float(optimal_controls[0])
+        best_omega = float(optimal_controls[self.N])
 
-# =========================================================
-# STEERING CONTROLLER
-# =========================================================
+        predicted_traj = self.predict_trajectory(
+            x0, y0, theta0, 
+            optimal_controls[:self.N], 
+            optimal_controls[self.N:]
+        )
 
-class Controller:
-    """Pixel-error PD steering controller."""
-
-    def __init__(
-        self,
-        kp: float = 0.015,
-        kd: float = 0.005,
-        max_angular: float = 0.43,
-    ):
-        self.kp = float(kp)
-        self.kd = float(kd)
-        self.max_angular = abs(float(max_angular))
-        self.previous_error = 0.0
-
-    def compute(self, error: float) -> float:
-        error = float(error)
-
-        derivative = error - self.previous_error
-        self.previous_error = error
-
-        omega = (self.kp * error + self.kd * derivative)
-
-        return float(np.clip(omega, -self.max_angular, self.max_angular))
-
-    def reset(self) -> None:
-        self.previous_error = 0.0
+        return best_v_norm, best_omega, predicted_traj
 
 
 # =========================================================
@@ -155,16 +206,14 @@ class Driver(Node):
         self.declare_parameter("max_speed", DEFAULT_MAX_SPEED)
         self.declare_parameter("roi_start_ratio", DEFAULT_ROI_START_RATIO)
         self.declare_parameter("roi_end_ratio", DEFAULT_ROI_END_RATIO)
-        self.declare_parameter("control_target_y_ratio", DEFAULT_CONTROL_TARGET_Y_RATIO)
         self.declare_parameter("lost_frame_limit", DEFAULT_LOST_FRAME_LIMIT)
         self.declare_parameter("grace_speed", DEFAULT_GRACE_SPEED)
-        self.declare_parameter("grace_omega_decay", DEFAULT_GRACE_OMEGA_DECAY),
+        self.declare_parameter("grace_omega_decay", DEFAULT_GRACE_OMEGA_DECAY)
         self.declare_parameter("safety_stop_distance", DEFAULT_SAFETY_STOP_DISTANCE_M)
         default_lane_width = float(self.get_parameter("default_lane_width").value)
         self.max_speed = max(0.0, float(self.get_parameter("max_speed").value))
         roi_start_ratio = float(self.get_parameter("roi_start_ratio").value)
         roi_end_ratio = float(self.get_parameter("roi_end_ratio").value)
-        self.control_target_y_ratio = float(np.clip(self.get_parameter("control_target_y_ratio").value, 0.0, 1.0,))
         self.lost_frame_limit = max(0, int(self.get_parameter("lost_frame_limit").value))
         self.grace_speed = max(0.0, float(self.get_parameter("grace_speed").value))
         self.grace_omega_decay = float(np.clip(self.get_parameter("grace_omega_decay").value, 0.0, 1.0))
@@ -184,9 +233,9 @@ class Driver(Node):
             alpha_lane_width=0.07,
         )
 
-        self.ctrl = Controller()
-        self.error_filter = LowPassFilter(alpha=0.25)
-
+        # Initialize MPC
+        self.mpc = MPCController(N=10, dt=0.1, v_pixel_max=120.0, max_angular=0.45)
+        
         # ---------------------------------------------
         # LiDAR state
         # ---------------------------------------------
@@ -215,33 +264,23 @@ class Driver(Node):
         # ---------------------------------------------
 
         self.create_subscription(
-            LaserScan,
-            "/scan",
-            self.lidar_cb,
-            qos_profile_sensor_data,
+            LaserScan, "/scan", self.lidar_cb, qos_profile_sensor_data,
         )
-
         self.create_subscription(
-            Image,
-            "/seg/bev_mask",
-            self.cb,
-            1,
+            Image, "/seg/bev_mask", self.cb, 1
         )
-
         self.pub = self.create_publisher(
-            Twist,
-            "/cmd_vel",
-            1,
+            Twist, "/cmd_vel", 1
+        )
+        self.pub_mpc_traj = self.create_publisher(
+            Float32MultiArray, "/seg/mpc_trajectory", 1
         )
 
         self.get_logger().info(
             "Lane-following driver active. "
             "Overtaking disabled."
         )
-        self.get_logger().info(
-            f"Fixed control target ratio: "
-            f"{self.control_target_y_ratio:.2f}"
-        )
+        
         self.get_logger().info(
             f"Grace hold: {self.lost_frame_limit} frames, "
             f"speed={self.grace_speed:.3f}, "
@@ -285,25 +324,19 @@ class Driver(Node):
                 right_ranges.append(distance)
 
         self.obstacle_dist = (
-            min(front_ranges)
-            if front_ranges
-            else float("inf")
+            min(front_ranges) if front_ranges else float("inf")
         )
 
         self.left_clear = (
-            min(left_ranges) > 0.35
-            if left_ranges
-            else True
+            min(left_ranges) > 0.35 if left_ranges else True
         )
 
         self.right_clear = (
-            min(right_ranges) > 0.35
-            if right_ranges
-            else True
+            min(right_ranges) > 0.35 if right_ranges else True
         )
 
     # -----------------------------------------------------
-    # Grace hold
+    # HELPERS
     # -----------------------------------------------------
 
     def _publish_grace_or_stop(
@@ -325,7 +358,7 @@ class Driver(Node):
             self.last_valid_omega *= self.grace_omega_decay
 
             cmd.linear.x = min(self.grace_speed, self.max_speed)
-            cmd.angular.z = float(np.clip(self.last_valid_omega, -self.ctrl.max_angular, self.ctrl.max_angular))
+            cmd.angular.z = float(np.clip(self.last_valid_omega, -self.mpc.max_omega, self.mpc.max_omega))
 
             self.get_logger().warn(
                 f"{reason}; grace hold "
@@ -343,6 +376,21 @@ class Driver(Node):
             )
 
         self.pub.publish(cmd)
+        
+    def _publish_mpc_debug(self, predicted_traj, v_norm, omega, state):
+        if predicted_traj is not None:
+            traj_msg = Float32MultiArray()
+            traj_msg.data = predicted_traj.flatten().tolist()  # Flatten Nx2 array to 1D list
+            self.pub_mpc_traj.publish(traj_msg)
+
+        # Calculate final speed
+        speed = self.max_speed * v_norm
+        if state in (STATE_LEFT_ONLY, STATE_RIGHT_ONLY, STATE_DRIVABLE):
+            speed = min(speed, self.max_speed * 0.70)
+        speed = float(np.clip(speed, 0.10, self.max_speed))
+
+        # Print to the terminal
+        self.get_logger().info(f"MPC | v_norm: {v_norm:.2f} | Speed: {speed:.2f} m/s | Omega: {omega:.2f} rad/s")
 
     # -----------------------------------------------------
     # Main BEV callback
@@ -390,76 +438,51 @@ class Driver(Node):
         if not path_valid:
             self._publish_grace_or_stop("No valid tracking path")
             return
-
+        
         # ---------------------------------------------
-        # Dynamic lookahead control
+        # MPC Dynamic Velocity and Steering Calculation
         # ---------------------------------------------
         
-        # Calculate how far up the screen the path is visible (0.0 is top, 1.0 is bottom)
-        visible_ratio = float(center_y_min) / float(height)
+        # The car always physically starts at the exact center of the bumper
+        car_x = width / 2.0
+        car_y = float(height)
+        car_theta = -np.pi / 2.0 
+
+        # Instead of shifting the car, we shift the mathematical target path!
+        # This keeps the red line perfectly anchored to the car's bumper on the screen.
+        solver_path = center_path.copy()
+        if state != STATE_BOTH:
+            # Note: We ADD the offset to the path, which is mathematically 
+            # equivalent to SUBTRACTING it from the car
+            solver_path[:, 0] += tune_offset_px
+
+        # The MPC now returns optimal velocity, steering, AND its predicted path
+        v_norm, omega, predicted_traj = self.mpc.compute(car_x, car_y, car_theta, solver_path)
         
-        # Target a safe distance (e.g., 25% of the screen) below the furthest visible point.
-        # Clip it between 0.65 (fast straightaways) and 0.88 (sharp curves near the bumper).
-        dynamic_target_ratio = np.clip(visible_ratio + 0.10, 0.95, 0.99)        
-        target_y = dynamic_target_ratio * float(height - 1)
-        distances = np.abs(center_path[:, 1] - target_y)
-        closest_index = int(np.argmin(distances))
-        center_x = float(center_path[closest_index, 0])
-        selected_y = float(center_path[closest_index, 1])
-
-        # The extrapolated path should pass near the fixed control row.
-        # If it does not, the current path is not useful for control.
-        maximum_y_error = max(8.0, height * 0.12)
-
-        target_y_error = abs(selected_y - target_y)
-
-        center_plausible = (np.isfinite(center_x) and -float(width) <= center_x <= 2.0 * float(width))
-
-        if (target_y_error > maximum_y_error or not center_plausible):
-            self._publish_grace_or_stop("Path does not reach a valid control target")
-            return
-
+        # Publish debug information about the MPC to BEV
+        self._publish_mpc_debug(predicted_traj, v_norm, omega, state)
+        
         # ---------------------------------------------
-        # Steering calculation
+        # Save memory for grace_hold
         # ---------------------------------------------
-        if state == STATE_BOTH:
-            desired_center = width / 2.0
-        else:
-            # Apply the tuning offset directly to the target center
-            desired_center = (width / 2.0) + tune_offset_px
-
-        raw_error = desired_center - center_x
-        smoothed_error = self.error_filter.filter(raw_error)
-        omega = self.ctrl.compute(smoothed_error)
-
-        # ---------------------------------------------
-        # Save valid tracking memory
-        # ---------------------------------------------
-
-        self.last_valid_center = center_x
-        self.last_valid_error = raw_error
         self.last_valid_omega = omega
         self.lost_frames = 0
 
-        # ---------------------------------------------
-        # Speed selection
-        # ---------------------------------------------
-
-        speed = self.max_speed - abs(omega) * 0.08
-
+        # --- NEW: Dynamic speed based on MPC prediction ---
+        # The fixed formula `speed = self.max_speed - abs(omega) * 0.08` has been removed.
+        speed = self.max_speed * v_norm
+        
+        # Optional: Maintain a safety limit if the camera is missing a line
         if state in (STATE_LEFT_ONLY, STATE_RIGHT_ONLY, STATE_DRIVABLE):
             speed = min(speed, self.max_speed * 0.70)
-
-        minimum_tracking_speed = min(0.10, self.max_speed)
-
-        speed = float(np.clip(speed, minimum_tracking_speed, self.max_speed))
+            
+        speed = float(np.clip(speed, 0.10, self.max_speed))
 
         cmd = Twist()
         cmd.linear.x = speed
         cmd.angular.z = omega
-
         self.pub.publish(cmd)
-
+        
 
 # =========================================================
 # MAIN

@@ -19,18 +19,22 @@ Run:
 from __future__ import annotations
 import os
 import sys  
-import cv2
 import numpy as np
 import yaml
+
 import rclpy
-from cv_bridge import CvBridge
 from rclpy.node import Node
-from sensor_msgs.msg import Image  
+
+import cv2
+from cv_bridge import CvBridge
+
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float32MultiArray
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bev.bev_transform import undistort_mask, to_bev, cleanup_bev, scale_intrinsics
 
-# Import shared lane analysis from lane_analyzer.py
 from lane_analyzer import (
     LaneAnalyzer,
     LaneOverlayRenderer,
@@ -122,12 +126,21 @@ class SegBEVNode(Node):
         self.bridge = CvBridge()
         self._frames = 0  
         
+        # --- ROS2 Subscriptions and Publications ---
         self.sub          = self.create_subscription(Image, mask_topic, self.image_callback, 10)
         self.pub_bev_mask = self.create_publisher(Image, "/seg/bev_mask", 10)
         self.pub_bev      = self.create_publisher(Image, "/seg/bev", 10)
         self.pub_overlay  = self.create_publisher(Image, "/seg/bev_overlay", 10)  
         self.pub_bev_grid = self.create_publisher(Image, "/seg/bev_grid", 10)
         self.pub_bev_debug = self.create_publisher(Image, "/seg/bev_debug", 10)
+        
+        # --- MPC Debug Publishers ---
+        self.latest_mpc_traj = None
+        self.latest_speed = 0.0
+        self.latest_omega = 0.0
+        
+        self.sub_mpc_traj = self.create_subscription(Float32MultiArray, "/seg/mpc_trajectory", self.traj_cb, 10)
+        self.sub_cmd_vel = self.create_subscription(Twist, "/cmd_vel", self.cmd_cb, 10)  
         
         self.get_logger().info(f"Subscribed to mask topic: {mask_topic}")
         self.get_logger().info(f"Expected mask size     : {self.mask_w}x{self.mask_h}")
@@ -176,6 +189,14 @@ class SegBEVNode(Node):
             cv2.putText(vis, lbl, (x + 4, y - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 0), 1)
         return vis  
+
+    def traj_cb(self, msg: Float32MultiArray):
+        if msg.data:
+            self.latest_mpc_traj = np.array(msg.data).reshape(-1, 2)
+            
+    def cmd_cb(self, msg: Twist):
+        self.latest_speed = msg.linear.x
+        self.latest_omega = msg.angular.z
 
     def image_callback(self, msg: Image):
         mask = self.bridge.imgmsg_to_cv2(msg, desired_encoding="mono8")
@@ -232,26 +253,23 @@ class SegBEVNode(Node):
             debug_img = overlay.copy()
             h, w = debug_img.shape[:2]
 
-            # 1. Draw the Static ROI Bounds (Red & Blue)
+            # 1. Draw ROI bounds
             y0 = int(round(h * self.roi_start_ratio))
             y1 = int(round(h * self.roi_end_ratio))
             y0 = max(0, min(h - 1, y0))
             y1 = max(y0 + 1, min(h, y1))
+            cv2.line(debug_img, (0, y0), (w, y0), (0, 0, 255), 2)
+            cv2.line(debug_img, (0, y1), (w, y1), (255, 0, 0), 2)
 
-            cv2.line(debug_img, (0, y0), (w, y0), (0, 0, 255), 2)  # ROI Start (Red)
-            cv2.line(debug_img, (0, y1), (w, y1), (255, 0, 0), 2)  # ROI End (Blue)
+            # 2. Draw MPC Predicted Trajectory (Red with Yellow Dots)
+            if self.latest_mpc_traj is not None and len(self.latest_mpc_traj) > 1:
+                traj = self.latest_mpc_traj
+                for i in range(len(traj) - 1):
+                    pt1 = (int(traj[i, 0]), int(traj[i, 1]))
+                    pt2 = (int(traj[i+1, 0]), int(traj[i+1, 1]))
+                    cv2.line(debug_img, pt1, pt2, (0, 0, 255), 2)
+                    cv2.circle(debug_img, pt1, 3, (0, 255, 255), -1)
 
-            _, _, _, center_y_min, _, _, _ = self.analyzer.analyze(bev_mask)
-
-            # 3. Calculate and Draw the Dynamic Lookahead Target (Green)
-            visible_ratio = float(center_y_min) / float(h)
-            dynamic_target_ratio = np.clip(visible_ratio + 0.10, 0.95, 0.99)
-            target_y_px = int(round(dynamic_target_ratio * float(h - 1)))
-            
-            # Draw a bright green line for the dynamic target
-            cv2.line(debug_img, (0, target_y_px), (w, target_y_px), (0, 0, 0), 2)
-
-            # Convert to ROS Image message and publish
             debug_msg = self.bridge.cv2_to_imgmsg(debug_img, encoding="bgr8")
             debug_msg.header = msg.header
             self.pub_bev_debug.publish(debug_msg)

@@ -96,6 +96,7 @@ class LimoSegmentationNode(Node):
         self.declare_parameter("overlay_topic", "/seg/cam_overlay")
         self.declare_parameter("save_dir", os.path.expanduser("~/limo_frames"))
         self.declare_parameter("save_every", 1)
+        self.declare_parameter("save_frames", False)
         self.declare_parameter("segment_every", 1)
         self.declare_parameter("target_width", 640)
         self.declare_parameter("target_height", 480)
@@ -127,6 +128,7 @@ class LimoSegmentationNode(Node):
 
         self.save_dir         = os.path.expanduser(self.get_parameter("save_dir").value)
         self.save_every       = self.get_parameter("save_every").value
+        self.save_frames      = self.get_parameter("save_frames").value
         self.segment_every    = self.get_parameter("segment_every").value
         self.tgt_w            = self.get_parameter("target_width").value
         self.tgt_h            = self.get_parameter("target_height").value
@@ -317,7 +319,7 @@ class LimoSegmentationNode(Node):
             label_bgr   = None
             overlay_bgr = None
 
-        if self.frame_count % self.save_every == 0:
+        if self.save_frames and self.frame_count % self.save_every == 0:
             self._save_outputs(upscaled, full_mask, label_bgr, overlay_bgr)
 
     def _save_outputs(self, raw_bgr: np.ndarray, mask: np.ndarray | None, label_bgr: np.ndarray | None, overlay_bgr: np.ndarray | None):
