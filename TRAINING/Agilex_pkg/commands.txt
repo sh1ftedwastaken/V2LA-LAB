@@ -14,8 +14,9 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/limo_segmentation_node.py \
 -p label_topic:=/limo/camera/label_image \
 -p model_input_width:=320 \
 -p model_input_height:=240 \
--p bev_mask_width:=160 \
--p bev_mask_height:=120
+-p bev_mask_width:=320 \
+-p bev_mask_height:=240 \
+-p calibrate_mode:=True
 
 
 TERMINAL 5:
@@ -28,7 +29,6 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/seg_bev_node.py \
 -p bev_size:=160 \
 -p mask_width:=160 \
 -p mask_height:=120 \
--p calibrate_mode:=True \
 -p debug_mode:=True
 
 

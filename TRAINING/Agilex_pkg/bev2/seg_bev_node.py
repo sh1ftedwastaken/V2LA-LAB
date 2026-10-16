@@ -10,11 +10,9 @@ Topics subscribed:
 Topics published:
     /seg/bev_mask               (sensor_msgs/Image)  - BEV cleaned mask (mono8)
     /seg/bev                    (sensor_msgs/Image)  - colourised BEV for debugging
-    /seg/bev_overlay            (sensor_msgs/Image)  - driving ROI and center debug overlay  
-    /seg/bev_grid               (sensor_msgs/Image)  - calibration trapezoid overlay (when calibrate_mode:=True)
-    
+    /seg/bev_overlay            (sensor_msgs/Image)  - driving ROI and center debug overlay      
 Run:
-    ros2 run limo_seg seg_bev_node --ros-args -p calibrate_mode:=True
+    ros2 run limo_seg seg_bev_node --ros-args -p debug_mode:=True
 """
 from __future__ import annotations
 import os
@@ -70,24 +68,7 @@ class SegBEVNode(Node):
         self.declare_parameter("camera_offset_x_px", 0.0)
         self.declare_parameter("roi_start_ratio", DEFAULT_ROI_START_RATIO)
         self.declare_parameter("roi_end_ratio", DEFAULT_ROI_END_RATIO)
-        self.declare_parameter("calibrate_mode", False)
         self.declare_parameter("debug_mode", False)
-
-        
-        # BEV Source Parameters
-        self.declare_parameter("bev_src_bottom_left_x", 10)       # 15
-        self.declare_parameter("bev_src_bottom_left_y", 120.0)      # 240   
-        self.declare_parameter("bev_src_bottom_right_x", 155.5)     # 315
-        self.declare_parameter("bev_src_bottom_right_y", 120.0)     # 240
-        self.declare_parameter("bev_src_top_right_x", 108)        # 215
-        self.declare_parameter("bev_src_top_right_y", 80.0)        # 160
-        self.declare_parameter("bev_src_top_left_x", 56.0)         # 100
-        self.declare_parameter("bev_src_top_left_y", 80.0)         # 160
-        
-        # BEV Destination Parameters (Margin-based)
-        self.declare_parameter("bev_dst_margin_x", 20.0)
-        self.declare_parameter("bev_dst_top_y", 5.0)
-        self.declare_parameter("bev_dst_bottom_y", 162)
         
         # Parameters for lane analysis and overlay
         self.bev_size           = self.get_parameter("bev_size").value
@@ -99,7 +80,7 @@ class SegBEVNode(Node):
         self.lane_width_px      = self.get_parameter("default_lane_width").value
         self.roi_start_ratio    = self.get_parameter("roi_start_ratio").value
         self.roi_end_ratio      = self.get_parameter("roi_end_ratio").value
-        self.debug_mode = self.get_parameter("debug_mode").value
+        self.debug_mode         = self.get_parameter("debug_mode").value
         
         with open(params_path, "r", encoding="utf-8") as handle:
             cam = yaml.safe_load(handle)  
@@ -144,7 +125,6 @@ class SegBEVNode(Node):
         
         self.get_logger().info(f"Subscribed to mask topic: {mask_topic}")
         self.get_logger().info(f"Expected mask size     : {self.mask_w}x{self.mask_h}")
-        self.get_logger().info("seg_bev_node ready - waiting for masks (supports live calibration)")  
 
     def _get_src_points(self) -> np.ndarray:
         """Fetches live ROS parameters for source points."""
@@ -175,20 +155,6 @@ class SegBEVNode(Node):
         }.items():
             color[mask == cls] = bgr
         return color  
-        
-    def _draw_calib(self, mask: np.ndarray, src_points: np.ndarray) -> np.ndarray:
-        """Draws the calibration trapezoid over the mask."""
-        vis = self.colorize(mask)
-        pts = src_points.astype(np.int32).reshape(-1, 1, 2)
-        
-        cv2.polylines(vis, [pts], isClosed=True, color=(255, 0, 255), thickness=1)
-        
-        labels = ["0:BL", "1:BR", "2:TR", "3:TL"]
-        for (x, y), lbl in zip(src_points.astype(int), labels):
-            cv2.circle(vis, (x, y), 1, (0, 0, 255), -1)
-            cv2.putText(vis, lbl, (x + 4, y - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 0), 1)
-        return vis  
 
     def traj_cb(self, msg: Float32MultiArray):
         if msg.data:
@@ -211,12 +177,6 @@ class SegBEVNode(Node):
         src_points = self._get_src_points()
         dst_points = self._get_dst_points()
         h_matrix, _ = cv2.findHomography(src_points, dst_points)
-        
-        if self.get_parameter("calibrate_mode").value:
-            calib_img = self._draw_calib(mask, src_points)
-            calib_msg = self.bridge.cv2_to_imgmsg(calib_img, "bgr8")
-            calib_msg.header = msg.header
-            self.pub_bev_grid.publish(calib_msg)
 
         mask_undist = undistort_mask(mask, self.k, self.d)
         bev_mask = to_bev(
@@ -247,7 +207,7 @@ class SegBEVNode(Node):
         overlay_msg.header = msg.header
         self.pub_overlay.publish(overlay_msg)
         
-        # --- DEBUG CALCULATION ---
+        # --- DEBUG MODE ---
         if self.debug_mode:
             # Make a copy of the overlay that already has the fitted lines
             debug_img = overlay.copy()
