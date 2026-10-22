@@ -1,88 +1,99 @@
 #!/usr/bin/env python3
-"""
-safety_supervisor.py
-====================
-Layer 5: Safety supervisor
-Ensures the robot stops if the controller crashes or an obstacle is detected.
-"""
+"""Forward MPC requests to the LIMO; stop for front LiDAR or lost input."""
+
+import math
+import time
 
 import rclpy
-from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
-import time
+
 
 class SafetySupervisor(Node):
     def __init__(self):
-        super().__init__('safety_supervisor')
-        
-        # Publisher for the actual motor commands
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        
-        # Subscriptions
-        self.req_sub = self.create_subscription(Twist, '/cmd_vel_request', self.cmd_req_cb, 10)
-        self.scan_sub = self.create_subscription(LaserScan, '/scan', self.lidar_cb, rclpy.qos.qos_profile_sensor_data)
-        
-        # Watchdog timer runs at 10Hz
-        self.timer = self.create_timer(0.1, self.watchdog_cb)
-        
-        self.last_cmd_time = time.time()
-        self.current_cmd = Twist()
-        
-        # Safety states
-        self.obstacle_detected = False
-        self.safety_stop_distance = 0.30  # meters
-        
-        self.get_logger().info("Layer 5: Safety Supervisor Initialized.")
-        self.get_logger().info("Listening to /cmd_vel_request and publishing to /cmd_vel")
+        super().__init__("safety_supervisor")
 
-    def lidar_cb(self, msg: LaserScan):
-        """Run the LiDAR stop in its own callback."""
-        front_ranges = []
-        for index, distance in enumerate(msg.ranges):
-            angle = msg.angle_min + index * msg.angle_increment
-            if not (msg.range_min < distance < msg.range_max):
+        self.pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.create_subscription(
+            Twist, "/cmd_vel_request", self.on_request, 10
+        )
+        self.create_subscription(
+            LaserScan, "/scan", self.lidar_cb, qos_profile_sensor_data
+        )
+
+        self.request = Twist()
+        self.request_time = None
+        self.scan_time = None
+        self.front_clear = False
+        self.last_reason = None
+
+        self.create_timer(0.05, self.tick)
+        self.get_logger().info(
+            "Forwarding /cmd_vel_request when front LiDAR is clear."
+        )
+
+    def on_request(self, msg):
+        if not all(math.isfinite(x) for x in
+                   (msg.linear.x, msg.angular.z)):
+            self.request_time = None
+            return
+        self.request = msg
+        self.request_time = time.monotonic()
+
+    def lidar_cb(self, msg):
+        self.scan_time = time.monotonic()
+        front = []
+
+        for i, distance in enumerate(msg.ranges):
+            angle = msg.angle_min + i * msg.angle_increment
+            if abs(angle) > 0.26:
                 continue
-            
-            # Check a narrow cone directly in front of the robot (-15 to 15 degrees)
-            if -0.26 <= angle <= 0.26:
-                front_ranges.append(distance)
-                
-        min_dist = min(front_ranges) if front_ranges else float('inf')
-        
-        if min_dist < self.safety_stop_distance:
-            if not self.obstacle_detected:
-                self.get_logger().warn(f"STOP: Obstacle detected at {min_dist:.2f}m!")
-            self.obstacle_detected = True
-        else:
-            self.obstacle_detected = False
 
-    def cmd_req_cb(self, msg: Twist):
-        """Receive requested commands from the Layer 4 controller."""
-        self.last_cmd_time = time.time()
-        self.current_cmd = msg
+            if math.isnan(distance):
+                continue
 
-    def watchdog_cb(self):
-        """
-        Send zero if the controller command is older than 0.2 s, 
-        or if an obstacle is detected.
-        """
-        time_since_last_cmd = time.time() - self.last_cmd_time
-        
-        safe_cmd = Twist()
-        
-        # Rule 1: Watchdog Timeout (Command older than 0.2 seconds)
-        # Rule 2: LiDAR Emergency Stop
-        if time_since_last_cmd > 0.2 or self.obstacle_detected:
-            safe_cmd.linear.x = 0.0
-            safe_cmd.angular.z = 0.0
-            
-        # Rule 3: Normal Operation
+            if math.isinf(distance):
+                # Common LaserScan convention: no object returned
+                # within the scanner's measurable range.
+                continue
+
+            if msg.range_min <= distance <= msg.range_max:
+                front.append(distance)
+
+        # Require at least one measurable front reading. Do not
+        # interpret an absent or entirely unreadable scan as clear.
+        self.front_clear = bool(front) and min(front) >= 0.35
+
+    def tick(self):
+        now = time.monotonic()
+        output = Twist()
+
+        if self.scan_time is None or now - self.scan_time > 0.25:
+            reason = "NO_FRESH_SCAN"
+        elif not self.front_clear:
+            reason = "FRONT_NOT_CLEAR"
+        elif self.request_time is None or now - self.request_time > 0.20:
+            reason = "NO_FRESH_MPC_REQUEST"
         else:
-            safe_cmd = self.current_cmd
-            
-        # Only the supervisor publishes to the actual motors
-        self.cmd_pub.publish(safe_cmd)
+            reason = "FORWARDING_MPC"
+            output.linear.x = max(
+                0.0, min(0.25, self.request.linear.x)
+            )
+            output.angular.z = max(
+                -0.43, min(0.43, self.request.angular.z)
+            )
+
+        self.pub.publish(output)
+
+        if reason != self.last_reason:
+            self.get_logger().info(
+                f"{reason}: v={output.linear.x:.3f} "
+                f"omega={output.angular.z:.3f}"
+            )
+            self.last_reason = reason
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -92,10 +103,10 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        stop_cmd = Twist()
-        node.cmd_pub.publish(stop_cmd)
+        node.pub.publish(Twist())
         node.destroy_node()
         rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

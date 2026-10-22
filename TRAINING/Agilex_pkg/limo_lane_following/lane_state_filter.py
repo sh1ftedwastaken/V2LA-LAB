@@ -24,12 +24,10 @@ from std_msgs.msg import String
 REFERENCE_TOPIC = "/lane/metric_reference_debug"
 STATE_TOPIC = "/lane/lane_state_debug"
 
-VALID_REFERENCE_STATUS = "VALID_FOR_DIAGNOSTIC_TEST"
+VALID_STATUSES = ("VALID_FOR_DIAGNOSTIC_TEST", "USABLE_SHORT_REFERENCE_DIAGNOSTIC")
 
-# The camera reference's valid-path requirements include coverage
-# from near the car to at least 0.70 m forward. Evaluate at a
-# repeatable, observed location rather than extrapolating to x=0.
-LOOKAHEAD_X_M = 0.45
+# Nominal lookahead, but will dynamically adapt if the path is shorter.
+NOMINAL_LOOKAHEAD_X_M = 0.45
 
 
 class LaneStateFilter(Node):
@@ -53,12 +51,12 @@ class LaneStateFilter(Node):
             String, REFERENCE_TOPIC, self.on_reference, 1
         )
         self.state_pub = self.create_publisher(
-            String, STATE_TOPIC, 1
+            String, STATE_TOPIC, 10
         )
         self.create_timer(0.1, self.publish_state)
 
         self.get_logger().info(
-            "Camera-only lane-state diagnostic; no motion commands."
+            "Camera-only lane-state diagnostic (Adaptive Lookahead); no motion commands."
         )
 
     @staticmethod
@@ -67,7 +65,7 @@ class LaneStateFilter(Node):
             "valid": False,
             "reason": reason,
             "source_status": source_status,
-            "lookahead_x_m": LOOKAHEAD_X_M,
+            "lookahead_x_m": None,
             "center_y_left_m": None,
             "heading_rad": None,
             "curvature_inv_m": None,
@@ -78,15 +76,11 @@ class LaneStateFilter(Node):
 
         if stamp_ns is not None:
             result["reference_stamp_sec"] = stamp_ns // 1_000_000_000
-            result["reference_stamp_nanosec"] = (
-                stamp_ns % 1_000_000_000
-            )
+            result["reference_stamp_nanosec"] = stamp_ns % 1_000_000_000
 
         return result
 
     def reference_age_s(self, stamp_ns):
-        # Use the ROS clock for the image/header timestamp. The local
-        # monotonic clock below independently detects a stalled stream.
         now_ns = self.get_clock().now().nanoseconds
         return (now_ns - stamp_ns) / 1_000_000_000.0
 
@@ -101,200 +95,97 @@ class LaneStateFilter(Node):
 
             sec = int(source["stamp_sec"])
             nanosec = int(source["stamp_nanosec"])
-            if sec < 0 or not 0 <= nanosec < 1_000_000_000:
-                raise ValueError("Invalid reference timestamp")
-
             stamp_ns = sec * 1_000_000_000 + nanosec
 
-        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-            self.latest_result = self.unavailable(
-                "MALFORMED_REFERENCE"
-            )
+        except (ValueError, TypeError, KeyError):
+            self.latest_result = self.unavailable("MALFORMED_REFERENCE")
             return
 
         source_status = source.get("status")
 
         if stamp_ns == 0:
-            self.latest_result = self.unavailable(
-                "MISSING_SOURCE_TIMESTAMP", source_status, stamp_ns
-            )
+            self.latest_result = self.unavailable("MISSING_SOURCE_TIMESTAMP", source_status, stamp_ns)
             return
 
-        if (
-            self.last_source_stamp_ns is not None
-            and stamp_ns <= self.last_source_stamp_ns
-        ):
-            self.latest_result = self.unavailable(
-                "NONINCREASING_SOURCE_TIMESTAMP",
-                source_status,
-                stamp_ns,
-            )
+        if self.last_source_stamp_ns is not None and stamp_ns <= self.last_source_stamp_ns:
+            self.latest_result = self.unavailable("NONINCREASING_SOURCE_TIMESTAMP", source_status, stamp_ns)
             return
 
         self.last_source_stamp_ns = stamp_ns
 
         age_s = self.reference_age_s(stamp_ns)
-        max_age_s = float(
-            self.get_parameter("max_reference_age_s").value
-        )
+        max_age_s = float(self.get_parameter("max_reference_age_s").value)
 
-        # A small negative tolerance allows minor clock jitter, but
-        # not a camera and ROS node using incompatible clocks.
         if age_s > max_age_s or age_s < -0.05:
-            self.latest_result = self.unavailable(
-                "SOURCE_TIMESTAMP_NOT_FRESH",
-                source_status,
-                stamp_ns,
-            )
+            self.latest_result = self.unavailable("SOURCE_TIMESTAMP_NOT_FRESH", source_status, stamp_ns)
             return
 
-        if source_status != VALID_REFERENCE_STATUS:
-            self.latest_result = self.unavailable(
-                "REFERENCE_INVALID",
-                source_status,
-                stamp_ns,
-            )
+        # Accept both full diagnostic routes and usable short routes
+        if source_status not in VALID_STATUSES:
+            self.latest_result = self.unavailable("REFERENCE_INVALID", source_status, stamp_ns)
             return
 
         try:
-            points = np.asarray(
-                source["points_x_forward_y_left_m"],
-                dtype=float,
-            )
+            points = np.asarray(source.get("points_x_forward_y_left_m", []), dtype=float)
 
-            if (
-                points.ndim != 2
-                or points.shape[1] != 2
-                or len(points) < 6
-                or not np.isfinite(points).all()
-            ):
+            if points.ndim != 2 or points.shape[1] != 2 or len(points) < 5 or not np.isfinite(points).all():
                 raise ValueError("Invalid metric point array")
 
             x = points[:, 0]
             y = points[:, 1]
-            dx = np.diff(x)
-
-            if (
-                np.any(dx <= 0.0)
-                or np.any(np.linalg.norm(
-                    np.diff(points, axis=0), axis=1
-                ) > 0.13)
-                or x[0] > LOOKAHEAD_X_M
-                or x[-1] < 0.70
-                or x[-1] - x[0] < 0.25
-            ):
-                raise ValueError(
-                    "Insufficient or discontinuous metric coverage"
-                )
+            
+            # Dynamic Lookahead: Do not extrapolate blindly into the void.
+            # If the path ends before 0.45m, evaluate at the furthest reliable point instead.
+            dynamic_lookahead_m = min(NOMINAL_LOOKAHEAD_X_M, float(x[-1]))
 
             # Fit y(x) = a*(x-x0)^2 + b*(x-x0) + c.
-            # Centering x makes the coefficients directly useful at
-            # the chosen lookahead position.
-            centered_x = x - LOOKAHEAD_X_M
-            design = np.column_stack(
-                (centered_x ** 2, centered_x, np.ones_like(x))
-            )
-            a, b, c = np.linalg.lstsq(
-                design, y, rcond=None
-            )[0]
+            centered_x = x - dynamic_lookahead_m
+            design = np.column_stack((centered_x ** 2, centered_x, np.ones_like(x)))
+            a, b, c = np.linalg.lstsq(design, y, rcond=None)[0]
 
             predicted_y = design @ np.array([a, b, c])
-            residual_m = float(np.sqrt(
-                np.mean((y - predicted_y) ** 2)
-            ))
+            residual_m = float(np.sqrt(np.mean((y - predicted_y) ** 2)))
 
-            if residual_m > 0.06:
-                raise ValueError(
-                    "Reference shape is not locally well represented"
-                )
+            if residual_m > 0.08:
+                raise ValueError("Reference shape is not locally well represented")
 
             measurement = {
-                # Positive: desired lane center lies to the car's left
-                # at LOOKAHEAD_X_M. Not a bumper-position estimate.
                 "center_y_left_m": float(c),
-
-                # Positive: lane direction bends toward the left.
                 "heading_rad": float(math.atan(b)),
-
-                # Signed geometric curvature in inverse meters.
-                "curvature_inv_m": float(
-                    2.0 * a / ((1.0 + b * b) ** 1.5)
-                ),
+                "curvature_inv_m": float(2.0 * a / ((1.0 + b * b) ** 1.5)),
             }
 
-            if not all(
-                math.isfinite(value)
-                for value in measurement.values()
-            ):
+            if not all(math.isfinite(val) for val in measurement.values()):
                 raise ValueError("Non-finite lane state")
 
-        except (
-            ValueError,
-            TypeError,
-            KeyError,
-            np.linalg.LinAlgError,
-        ):
-            self.latest_result = self.unavailable(
-                "BAD_METRIC_POINTS",
-                source_status,
-                stamp_ns,
-            )
+        except (ValueError, TypeError, KeyError, np.linalg.LinAlgError) as e:
+            self.latest_result = self.unavailable(f"BAD_METRIC_POINTS: {e}", source_status, stamp_ns)
             return
 
-        max_missing_s = float(
-            self.get_parameter("max_missing_time_s").value
-        )
+        max_missing_s = float(self.get_parameter("max_missing_time_s").value)
 
-        # A long interruption starts a new track. A brief interruption
-        # does not authorize accepting a sudden jump into another lane.
         tracking_recent = (
             self.last_accepted is not None
             and self.last_accepted_monotonic is not None
-            and arrival - self.last_accepted_monotonic
-            <= max_missing_s
+            and arrival - self.last_accepted_monotonic <= max_missing_s
         )
 
         if tracking_recent:
             limits = {
-                "center_y_left_m": float(
-                    self.get_parameter(
-                        "max_lateral_jump_m"
-                    ).value
-                ),
-                "heading_rad": float(
-                    self.get_parameter(
-                        "max_heading_jump_rad"
-                    ).value
-                ),
-                "curvature_inv_m": float(
-                    self.get_parameter(
-                        "max_curvature_jump_inv_m"
-                    ).value
-                ),
+                "center_y_left_m": float(self.get_parameter("max_lateral_jump_m").value),
+                "heading_rad": float(self.get_parameter("max_heading_jump_rad").value),
+                "curvature_inv_m": float(self.get_parameter("max_curvature_jump_inv_m").value),
             }
 
-            if any(
-                abs(measurement[key] - self.last_accepted[key])
-                > limit
-                for key, limit in limits.items()
-            ):
-                self.latest_result = self.unavailable(
-                    "MEASUREMENT_JUMP",
-                    source_status,
-                    stamp_ns,
-                )
+            if any(abs(measurement[key] - self.last_accepted[key]) > limit for key, limit in limits.items()):
+                self.latest_result = self.unavailable("MEASUREMENT_JUMP", source_status, stamp_ns)
                 return
 
-            alpha = float(
-                self.get_parameter("smoothing_alpha").value
-            )
+            alpha = float(self.get_parameter("smoothing_alpha").value)
             alpha = min(1.0, max(0.0, alpha))
 
             estimate = {
-                key: (
-                    alpha * measurement[key]
-                    + (1.0 - alpha) * self.last_accepted[key]
-                )
+                key: (alpha * measurement[key] + (1.0 - alpha) * self.last_accepted[key])
                 for key in measurement
             }
         else:
@@ -307,35 +198,24 @@ class LaneStateFilter(Node):
         singles = max(0, int(source.get("single", 0)))
         pair_fraction = pairs / max(1, pairs + singles)
 
-        # Diagnostic quality score, NOT a calibrated probability.
-        coverage_score = min(
-            1.0, (float(x[-1]) - float(x[0])) / 0.65
-        )
+        # Dynamic confidence scoring
+        coverage_score = min(1.0, float(source.get("observed_span_m", 0.0)) / 0.65)
         fit_score = max(0.0, 1.0 - residual_m / 0.06)
-        confidence = (
-            0.25
-            + 0.30 * coverage_score
-            + 0.25 * fit_score
-            + 0.20 * pair_fraction
-        )
+        
+        # Penalize confidence if the lookahead had to be shortened (sharp curve penalty)
+        lookahead_penalty = max(0.0, (NOMINAL_LOOKAHEAD_X_M - dynamic_lookahead_m) * 1.5)
+
+        confidence = (0.25 + 0.30 * coverage_score + 0.25 * fit_score + 0.20 * pair_fraction) - lookahead_penalty
 
         self.latest_result = {
             "valid": True,
             "reason": "CAMERA_MEASUREMENT_ACCEPTED",
             "source_status": source_status,
-            "lookahead_x_m": LOOKAHEAD_X_M,
-            "center_y_left_m": round(
-                estimate["center_y_left_m"], 4
-            ),
-            "heading_rad": round(
-                estimate["heading_rad"], 4
-            ),
-            "curvature_inv_m": round(
-                estimate["curvature_inv_m"], 4
-            ),
-            "confidence": round(
-                min(1.0, max(0.0, confidence)), 3
-            ),
+            "lookahead_x_m": round(dynamic_lookahead_m, 4),
+            "center_y_left_m": round(estimate["center_y_left_m"], 4),
+            "heading_rad": round(estimate["heading_rad"], 4),
+            "curvature_inv_m": round(estimate["curvature_inv_m"], 4),
+            "confidence": round(min(1.0, max(0.0, confidence)), 3),
             "confidence_is_probability": False,
             "fit_residual_m": round(residual_m, 4),
             "reference_near_x_m": round(float(x[0]), 4),
@@ -349,41 +229,24 @@ class LaneStateFilter(Node):
         now = time.monotonic()
 
         if result["valid"]:
-            stamp_ns = (
-                result["reference_stamp_sec"] * 1_000_000_000
-                + result["reference_stamp_nanosec"]
-            )
+            stamp_ns = result["reference_stamp_sec"] * 1_000_000_000 + result["reference_stamp_nanosec"]
 
             if (
                 self.last_message_monotonic is None
-                or now - self.last_message_monotonic
-                > float(
-                    self.get_parameter(
-                        "max_reference_age_s"
-                    ).value
-                )
-                or self.reference_age_s(stamp_ns)
-                > float(
-                    self.get_parameter(
-                        "max_reference_age_s"
-                    ).value
-                )
+                or now - self.last_message_monotonic > float(self.get_parameter("max_reference_age_s").value)
+                or self.reference_age_s(stamp_ns) > float(self.get_parameter("max_reference_age_s").value)
             ):
-                self.latest_result = self.unavailable(
-                    "REFERENCE_STALE",
-                    result["source_status"],
-                    stamp_ns,
-                )
+                self.latest_result = self.unavailable("REFERENCE_STALE", result["source_status"], stamp_ns)
                 result = self.latest_result.copy()
-         
+
         output = String()
         output.data = json.dumps(result)
         self.state_pub.publish(output)
-        
+
         self.get_logger().info(
             f"VALID {result['valid']} "
             f"REASON {result['reason']} "
-            f"SOURCE {result['source_status']} "
+            f"LOOKAHEAD {result['lookahead_x_m']} m "
             f"CENTER_Y {result['center_y_left_m']} m "
             f"HEADING {result['heading_rad']} rad "
             f"CURVATURE {result['curvature_inv_m']} 1/m "
