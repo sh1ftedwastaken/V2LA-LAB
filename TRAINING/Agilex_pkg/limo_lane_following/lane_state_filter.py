@@ -21,7 +21,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 
-REFERENCE_TOPIC = "/lane/metric_reference_debug"
+REFERENCE_TOPIC = "/lane/metric_reference"
 STATE_TOPIC = "/lane/lane_state_debug"
 
 VALID_STATUSES = ("VALID_FOR_DIAGNOSTIC_TEST", "USABLE_SHORT_REFERENCE_DIAGNOSTIC")

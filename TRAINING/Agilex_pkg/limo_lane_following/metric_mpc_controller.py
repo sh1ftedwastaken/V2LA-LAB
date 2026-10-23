@@ -92,38 +92,48 @@ def prepare_path(source):
     headings = np.unwrap(
         np.arctan2(segment[:, 1], segment[:, 0])
     )
-    # This version models forward driving, not reversing or
-    # turning around on the spot.
-    # if np.any(np.abs(headings) > 1.45):
-    #     raise ValueError("FORWARD_MODEL_UNSUPPORTED")
 
     s = np.r_[0.0, np.cumsum(lengths)]
     return path, s, headings, arc
 
 
-def curvature_speed(s, headings, v_min, v_max, a_lat, window=0.6):
-    """Speed limit from the sharpest curvature in the next `window` m.
-    Skips segment 0 (the unobserved bumper-to-first-point link)."""
-    mid = 0.5 * (s[1:-1] + s[2:])      # midpoints of observed segments
-    h = headings[1:]
-    if len(mid) < 2 or s[-1] - s[1] < 0.2:
-        return v_min, 0.0
+def curvature_speed(s, headings, v_max, a_lat, max_w, window=0.6):
+    """Speed ceiling from curvature of observed segments, excluding
+    the artificial bumper-to-first-point segment."""
+    mid = 0.5 * (s[1:-1] + s[2:])
+    h = headings[1:]  
 
-    start = mid[0]
-    end = min(mid[-1], start + window)
-    d = np.arange(start, end, 0.10)
-    if len(d) < 2:
-        return v_min, 0.0
+    if len(mid) < 2:
+        return v_max, 0.0  
 
-    hd = np.interp(d, mid, h)
-    kappa = float(np.max(np.abs(np.diff(hd)) / 0.10))
-    v = math.sqrt(a_lat / max(kappa, 1e-3))
-    return float(np.clip(v, v_min, v_max)), kappa
+    end = min(float(mid[-1]), float(mid[0]) + window)
+    
+    # Sample densely (every 5 cm)
+    samples = np.arange(float(mid[0]), end, 0.05)
+    if len(samples) < 2:
+        return v_max, 0.0  
+
+    sampled_heading = np.interp(samples, mid, h)
+    
+    baseline_steps = min(len(samples) - 1, 5)
+    d_heading = sampled_heading[baseline_steps:] - sampled_heading[:-baseline_steps]
+    d_s = baseline_steps * 0.05
+    
+    kappa = float(np.max(np.abs(d_heading)) / max(d_s, 1e-3))
+
+    if kappa < 1e-3:
+        return v_max, kappa  
+
+    lateral_limit = math.sqrt(a_lat / kappa)
+    turning_limit = max_w / kappa
+    return min(v_max, lateral_limit, turning_limit), kappa
 
 
 class MetricMPC(Node):
     def __init__(self):
         super().__init__("metric_mpc_controller")
+        
+        self.declare_parameter("max_v", 0.20)
 
         self.request_pub = self.create_publisher(
             Twist, "/cmd_vel_request", 10
@@ -132,28 +142,29 @@ class MetricMPC(Node):
             String, "/lane/mpc_motion_debug", 10
         )
         self.create_subscription(
-            String, "/lane/metric_reference_debug",
+            String, "/lane/metric_reference",
             self.on_reference, 1
         )
-
-        self.latest = None
-        self.last_stamp_ns = None
-        self.last_arrival = None
+        
+        self.latest           = None
+        self.last_stamp_ns    = None
+        self.last_arrival     = None
         self.previous_command = np.zeros(2)
-        self.last_log_key = None
-        self.last_log_time = 0.0
+        self.last_log_key     = None
+        self.last_log_time    = 0.0
 
-        self.min_v = 0.08          # floor while a path is accepted
-        self.a_lat = 0.35          # m/s^2 allowed lateral accel
-        self.hold_ticks = 3        # ride through up to 0.3 s of bad frames
-        self.stop_count = 0
+        self.last_good_command_time = None
+        self.max_reference_loss_s   = 0.40
+        
+        self.a_lat = 0.35
         self.dt = 0.10
-        self.n = 8
-        self.max_v = 0.15
-        self.max_w = 0.45
-        self.max_dv = 0.05     # m/s per 0.10 s
-        self.max_dw = 0.08      # rad/s per 0.10 s
-        self.max_frame_age = 0.22
+        self.n  = 8
+        self.max_v   = float(self.get_parameter("max_v").value)
+        self.max_w   = 0.45
+        self.max_dv  = 0.05
+        self.loss_dv = 0.05      
+        self.max_dw  = 0.08
+        self.max_frame_age  = 0.22
         self.max_solve_time = 0.15
 
         self.create_timer(self.dt, self.tick)
@@ -211,6 +222,35 @@ class MetricMPC(Node):
                 self.get_logger().warn(line)
             self.last_log_key = key
             self.last_log_time = now
+            
+    def slow_for_missing_reference(self, reason):
+        now = time.monotonic()
+        previous_v, previous_w = map(float, self.previous_command)
+
+        if (self.last_good_command_time is None
+            or now - self.last_good_command_time
+            >= self.max_reference_loss_s):
+            self.stop(reason)
+            return
+
+        v = max(0.0, previous_v - self.loss_dv)
+
+        # Reduce turning with speed rather than repeatedly switching
+        # between the last steering command and zero.
+        if v <= 1e-6 or previous_v <= 1e-6:
+            w = 0.0
+        else:
+            desired_w = previous_w * (v / previous_v)
+            w = float(np.clip(desired_w,
+                previous_w - self.max_dw,
+                previous_w + self.max_dw,))
+
+        cmd = Twist()
+        cmd.linear.x = v
+        cmd.angular.z = w
+        self.previous_command[:] = (v, w)
+        self.request_pub.publish(cmd)
+        self.report("DECELERATING", reason, v, w)
 
     def stop(self, reason):
         self.previous_command = np.zeros(2)
@@ -219,7 +259,7 @@ class MetricMPC(Node):
 
     def tick(self):
         if self.latest is None or self.last_arrival is None:
-            self.stop("NO_REFERENCE")
+            self.slow_for_missing_reference("NO_REFERENCE")
             return
 
         now = time.monotonic()
@@ -234,7 +274,7 @@ class MetricMPC(Node):
             or age < -0.05
             or age > self.max_frame_age
         ):
-            self.stop("STALE_REFERENCE")
+            self.slow_for_missing_reference("STALE_REFERENCE")
             return
 
         try:
@@ -243,14 +283,16 @@ class MetricMPC(Node):
             self.stop(str(exc))
             return
 
-        # Reduce target speed on a short reference. The preview
-        # never extends past the last supplied reference point.
-        target_v, kappa = curvature_speed(
-            s, headings, self.min_v, self.max_v, self.a_lat
+        # Velocity calculation
+        curve_limit, kappa = curvature_speed(
+            s, headings, self.max_v, self.a_lat, self.max_w
         )
-        target_v = min(target_v, self.max_v)
-        if s[-1] < 0.35:
-            target_v = min(target_v, 0.025)
+        
+        coverage_limit = max(
+            0.0, (observed_arc - 0.06) / (self.n * self.dt)
+        )
+        
+        target_v = min(self.max_v, curve_limit, coverage_limit)
 
         def target_at(distance):
             d = min(float(distance), float(s[-1]))
@@ -305,11 +347,20 @@ class MetricMPC(Node):
                 self.max_dw + changes[:, 1],
             )).ravel()
 
-        initial = np.tile(
-            [min(target_v, last_v + self.max_dv), last_w], n
+        # Speed cap
+        speed_cap = min(
+            self.max_v,
+            max(target_v, float(last_v) - self.max_dv)
         )
+        initial_v = float(np.clip(
+            target_v,
+            max(0.0, float(last_v) - self.max_dv),
+            min(speed_cap, float(last_v) + self.max_dv),
+        ))
+
+        initial = np.tile([initial_v, last_w], n)
         bounds = [
-            (0.0, target_v) if i % 2 == 0
+            (0.0, speed_cap) if i % 2 == 0
             else (-self.max_w, self.max_w)
             for i in range(2 * n)
         ]
@@ -327,7 +378,7 @@ class MetricMPC(Node):
                          "disp": False},
             )
         except Exception as exc:
-            self.stop(f"SOLVER_EXCEPTION: {exc}")
+            self.slow_for_missing_reference(f"SOLVER_EXCEPTION: {exc}")
             return
 
         solve_time = time.monotonic() - started
@@ -338,7 +389,7 @@ class MetricMPC(Node):
             or solve_time > self.max_solve_time
             or np.min(rate_limits(solution.x)) < -1e-4
         ):
-            self.stop(
+            self.slow_for_missing_reference(
                 f"SOLVER_NOT_READY: {solution.message}; "
                 f"solve_s={solve_time:.3f}"
             )
@@ -346,24 +397,27 @@ class MetricMPC(Node):
 
         v, w = map(float, solution.x[:2])
         if v < -1e-5 or abs(w) > self.max_w + 1e-4:
-            self.stop("OUTPUT_OUT_OF_BOUNDS")
+            self.slow_for_missing_reference("OUTPUT_OUT_OF_BOUNDS")
             return
 
         cmd = Twist()
-        cmd.linear.x = max(self.min_v, min(self.max_v, v))
-        cmd.angular.z = max(-self.max_w, min(self.max_w, w))
-        self.previous_command[:] = (cmd.linear.x, cmd.angular.z)
-        self.stop_count = 0
+        cmd.linear.x = float(np.clip(v, 0.0, self.max_v))
+        cmd.angular.z = float(np.clip(w, -self.max_w, self.max_w))
+        self.previous_command[:] = (
+            cmd.linear.x, cmd.angular.z
+        )
+        self.last_good_command_time = time.monotonic()
         self.request_pub.publish(cmd)
         self.report(
-            "MPC_REQUEST", f"arc={observed_arc:.3f}m; "
+            "MPC_REQUEST",
+            f"arc={observed_arc:.3f}m; "
+            f"kappa={kappa:.2f}; "
+            f"target_v={target_v:.3f}; "
             f"solve={solve_time:.3f}s; "
-            f"source={source['status']}"
-            f"kappa={kappa:.2f}"
-            f"target_v={target_v:.3f}"
-            f"{cmd.linear.x=:.3f}, {cmd.angular.z=:.3f}"
+            f"source={source['status']}",
+            cmd.linear.x,
+            cmd.angular.z,
         )
-
 
 def main(args=None):
     rclpy.init(args=args)

@@ -36,15 +36,14 @@ SRC = np.float32([
     [210.0, 160.0],
     [105.0, 160.0],
 ])
+
+
 DST = np.float32([
     [0.305, +0.210],
     [0.305, -0.210],
     [0.930, -0.2115],
     [0.930, +0.2115],
 ])
-
-# Testing
-# DST[0] += 0.003 
 
 FULL_STATUS = "VALID_FOR_DIAGNOSTIC_TEST"
 SHORT_STATUS = "USABLE_SHORT_REFERENCE_DIAGNOSTIC"
@@ -219,9 +218,13 @@ class CameraMetricReference(Node):
         self.data_pub = self.create_publisher(
             String, "/lane/metric_reference_debug", 10
         )
+        self.reference_pub = self.create_publisher(
+    String, "/lane/metric_reference", 10
+        )
         self.create_subscription(
             Image, "/seg/mask_raw", self.on_mask, 10
         )
+        
 
         self.get_logger().info(
             "Corridor-associated reference diagnostic active; "
@@ -260,6 +263,7 @@ class CameraMetricReference(Node):
 
         text = String()
         text.data = json.dumps(result)
+        self.reference_pub.publish(text)
         self.data_pub.publish(text)
 
         line = (
