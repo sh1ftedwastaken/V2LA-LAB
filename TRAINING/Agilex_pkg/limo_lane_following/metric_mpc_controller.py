@@ -29,22 +29,46 @@ def wrap(angle):
 
 
 def prepare_path(source):
-    """Check and resample the ordered path; never sort it by X."""
+    """Check, filter duplicates, and resample the ordered path."""
     if source.get("status") not in (FULL, SHORT):
         raise ValueError("REFERENCE_INVALID")
 
-    points = np.asarray(
+    raw_points = np.asarray(
         source["points_x_forward_y_left_m"], dtype=float
     )
     if (
-        points.ndim != 2 or points.shape[1] != 2
-        or len(points) < 5 or not np.isfinite(points).all()
+        raw_points.ndim != 2 or raw_points.shape[1] != 2
+        or len(raw_points) < 5 or not np.isfinite(raw_points).all()
     ):
         raise ValueError("BAD_POINTS")
 
+    # Filter out duplicate/ultra-close points instead of crashing
+    clean_points = [raw_points[0]]
+    for i in range(1, len(raw_points)):
+        if np.linalg.norm(raw_points[i] - clean_points[-1]) >= 0.001:  # 1 mm minimum step
+            clean_points.append(raw_points[i])
+            
+    points = np.asarray(clean_points)
+    if len(points) < 5:
+        raise ValueError("BAD_POINTS_AFTER_FILTERING")
+
+    # Allowed step grows with distance (perspective), matching the
+    # camera reference. Keep the connected prefix; drop the far tail.
     steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
-    if np.any(steps < 0.0005) or np.any(steps > 0.25):
-        raise ValueError("DISCONNECTED_OR_DUPLICATE_PATH")
+    limits = np.maximum(0.15, 0.20 * points[1:, 0])
+    bad = np.flatnonzero(steps > limits)
+    if len(bad):
+        points = points[: bad[0] + 1]   # truncate at first real jump
+        steps = steps[: bad[0]]
+
+    # Optional: ignore points far beyond the calibrated range (0.93 m)
+    keep = points[:, 0] <= 1.2
+    if keep.sum() >= 5:
+        points = points[keep]
+        steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+
+    if len(points) < 5:
+        raise ValueError("DISCONNECTED_PATH_TOO_SHORT")
 
     arc = float(np.sum(steps))
     if arc < 0.14:
@@ -77,6 +101,26 @@ def prepare_path(source):
     return path, s, headings, arc
 
 
+def curvature_speed(s, headings, v_min, v_max, a_lat, window=0.6):
+    """Speed limit from the sharpest curvature in the next `window` m.
+    Skips segment 0 (the unobserved bumper-to-first-point link)."""
+    mid = 0.5 * (s[1:-1] + s[2:])      # midpoints of observed segments
+    h = headings[1:]
+    if len(mid) < 2 or s[-1] - s[1] < 0.2:
+        return v_min, 0.0
+
+    start = mid[0]
+    end = min(mid[-1], start + window)
+    d = np.arange(start, end, 0.10)
+    if len(d) < 2:
+        return v_min, 0.0
+
+    hd = np.interp(d, mid, h)
+    kappa = float(np.max(np.abs(np.diff(hd)) / 0.10))
+    v = math.sqrt(a_lat / max(kappa, 1e-3))
+    return float(np.clip(v, v_min, v_max)), kappa
+
+
 class MetricMPC(Node):
     def __init__(self):
         super().__init__("metric_mpc_controller")
@@ -99,11 +143,15 @@ class MetricMPC(Node):
         self.last_log_key = None
         self.last_log_time = 0.0
 
+        self.min_v = 0.08          # floor while a path is accepted
+        self.a_lat = 0.35          # m/s^2 allowed lateral accel
+        self.hold_ticks = 3        # ride through up to 0.3 s of bad frames
+        self.stop_count = 0
         self.dt = 0.10
         self.n = 8
-        self.max_v = 0.25
+        self.max_v = 0.15
         self.max_w = 0.45
-        self.max_dv = 0.03     # m/s per 0.10 s
+        self.max_dv = 0.05     # m/s per 0.10 s
         self.max_dw = 0.08      # rad/s per 0.10 s
         self.max_frame_age = 0.22
         self.max_solve_time = 0.15
@@ -197,8 +245,8 @@ class MetricMPC(Node):
 
         # Reduce target speed on a short reference. The preview
         # never extends past the last supplied reference point.
-        target_v = (
-            0.04 if source["status"] == SHORT else self.max_v
+        target_v, kappa = curvature_speed(
+            s, headings, self.min_v, self.max_v, self.a_lat
         )
         target_v = min(target_v, self.max_v)
         if s[-1] < 0.35:
@@ -302,15 +350,18 @@ class MetricMPC(Node):
             return
 
         cmd = Twist()
-        cmd.linear.x = max(0.0, min(self.max_v, v))
+        cmd.linear.x = max(self.min_v, min(self.max_v, v))
         cmd.angular.z = max(-self.max_w, min(self.max_w, w))
         self.previous_command[:] = (cmd.linear.x, cmd.angular.z)
+        self.stop_count = 0
         self.request_pub.publish(cmd)
         self.report(
             "MPC_REQUEST", f"arc={observed_arc:.3f}m; "
             f"solve={solve_time:.3f}s; "
-            f"source={source['status']}",
-            cmd.linear.x, cmd.angular.z
+            f"source={source['status']}"
+            f"kappa={kappa:.2f}"
+            f"target_v={target_v:.3f}"
+            f"{cmd.linear.x=:.3f}, {cmd.angular.z=:.3f}"
         )
 
 

@@ -1,3 +1,46 @@
+# NEW LIMO_LANE_FOLLOWING COMMANDS:
+TERMINAL 1: 
+~/limo_code_StutiRuparel/limo_run.sh
+
+TERMINAL 2:
+source /opt/ros/foxy/setup.bash
+python3 /home/agilex/limo_code_StutiRuparel/bev2/limo_segmentation_node.py \
+--ros-args \
+-p checkpoint:=/home/agilex/limo_code_StutiRuparel/checkpoints/best_resnet34_unet_jaccard.pth \
+-p camera_topic:=/camera/color/image_raw \
+-p mask_topic:=/seg/mask \
+-p mask_raw_topic:=/seg/mask_raw \
+-p overlay_topic:=/seg/cam_overlay \
+-p label_topic:=/limo/camera/label_image \
+-p model_input_width:=320 \
+-p model_input_height:=240 \
+-p bev_mask_width:=320 \
+-p bev_mask_height:=240 \
+-p calibrate_mode:=True
+
+TERMINAL 3:
+source /opt/ros/foxy/setup.bash
+ros2 run rqt_image_view rqt_image_view
+
+TERMINAL 4:
+source /opt/ros/foxy/setup.bash
+python3 /home/agilex/limo_code_StutiRuparel/bev2/camera_metric_reference.py
+
+Terminal 5: 
+source /opt/ros/foxy/setup.bash
+python3 /home/agilex/limo_code_StutiRuparel/bev2/lane_state_filter.py
+
+Terminal 6:
+source /opt/ros/foxy/setup.bash
+python3 /home/agilex/limo_code_StutiRuparel/bev2/safety_supervisor.py
+
+Terminal 7:
+sudo ip link set lo multicast on
+source /opt/ros/foxy/setup.bash
+python3 /home/agilex/limo_code_StutiRuparel/bev2/metric_mpc_controller.py
+
+# OLD BEV2 COMMANDS:
+
 TERMINAL 1,2,3:
 ~/limo_code_StutiRuparel/limo_run.sh
 
