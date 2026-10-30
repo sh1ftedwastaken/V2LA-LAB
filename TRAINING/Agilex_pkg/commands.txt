@@ -39,6 +39,7 @@ sudo ip link set lo multicast on
 source /opt/ros/foxy/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/metric_mpc_controller.py
 
+
 # OLD BEV2 COMMANDS:
 
 TERMINAL 1,2,3:

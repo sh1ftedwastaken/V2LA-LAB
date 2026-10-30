@@ -69,6 +69,21 @@ def prepare_path(source):
 
     if len(points) < 5:
         raise ValueError("DISCONNECTED_PATH_TOO_SHORT")
+    
+    window = min(10, len(points))
+    if window % 2 == 0:
+        window -= 1 
+        
+    if window >= 3:
+        w = np.ones(window) / window
+        pad = window // 2
+        px = np.pad(points[:, 0], pad, mode='edge')
+        py = np.pad(points[:, 1], pad, mode='edge')
+        points[:, 0] = np.convolve(px, w, mode='valid')
+        points[:, 1] = np.convolve(py, w, mode='valid')
+        
+        # Recompute steps after smoothing
+        steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
 
     arc = float(np.sum(steps))
     if arc < 0.14:
@@ -97,43 +112,115 @@ def prepare_path(source):
     return path, s, headings, arc
 
 
-def curvature_speed(s, headings, v_max, a_lat, max_w, window=0.6):
-    """Speed ceiling from curvature of observed segments, excluding
-    the artificial bumper-to-first-point segment."""
-    mid = 0.5 * (s[1:-1] + s[2:])
-    h = headings[1:]  
+def curvature_speed(path, s, v_max, a_lat, max_w, window=0.6):
+    """Estimate curvature from local quadratic fits to X(s), Y(s).
 
-    if len(mid) < 2:
-        return v_max, 0.0  
+    Excludes the artificial bumper-to-first-reference connection.
+    Does not extrapolate past the supplied reference.
+    """
+    observed_s = np.asarray(s[1:], dtype=float)
+    observed_points = np.asarray(path[1:], dtype=float)
 
-    end = min(float(mid[-1]), float(mid[0]) + window)
-    
-    # Sample densely (every 5 cm)
-    samples = np.arange(float(mid[0]), end, 0.05)
-    if len(samples) < 2:
-        return v_max, 0.0  
+    if len(observed_points) < 5:
+        raise ValueError("CURVATURE_INSUFFICIENT_POINTS")
 
-    sampled_heading = np.interp(samples, mid, h)
-    
-    baseline_steps = min(len(samples) - 1, 5)
-    d_heading = sampled_heading[baseline_steps:] - sampled_heading[:-baseline_steps]
-    d_s = baseline_steps * 0.05
-    
-    kappa = float(np.max(np.abs(d_heading)) / max(d_s, 1e-3))
+    start = float(observed_s[0])
+    end = min(float(observed_s[-1]), start + window)
 
-    if kappa < 1e-3:
-        return v_max, kappa  
+    if end - start < 0.14:
+        raise ValueError("CURVATURE_INSUFFICIENT_SPAN")
 
-    lateral_limit = math.sqrt(a_lat / kappa)
-    turning_limit = max_w / kappa
-    return min(v_max, lateral_limit, turning_limit), kappa
+    # Uniform metric sampling prevents dense near-image points
+    # from dominating the fit.
+    count = max(8, int(math.ceil((end - start) / 0.025)) + 1)
+    grid = np.linspace(start, end, count)
+    xy = np.column_stack((
+        np.interp(grid, observed_s, observed_points[:, 0]),
+        np.interp(grid, observed_s, observed_points[:, 1]),
+    ))
+
+    estimates = []
+    residuals = []
+    locations = []
+
+    for center in grid:
+        # Approximately 0.25 m support, shifted inward at endpoints.
+        lo = max(start, min(float(center) - 0.125, end - 0.25))
+        hi = min(end, lo + 0.25)
+        selected = (grid >= lo - 1e-9) & (grid <= hi + 1e-9)
+
+        local_s = grid[selected] - center
+        local_xy = xy[selected]
+
+        if len(local_s) < 5:
+            continue
+
+        design = np.column_stack((
+            np.ones_like(local_s),
+            local_s,
+            local_s ** 2,
+        ))
+        coefficients, _, rank, _ = np.linalg.lstsq(
+            design, local_xy, rcond=None
+        )
+        if rank < 3:
+            continue
+
+        fitted = design @ coefficients
+        residual = float(np.sqrt(np.mean(
+            np.sum((fitted - local_xy) ** 2, axis=1)
+        )))
+
+        # A substantial mismatch is not something to smooth away.
+        if residual > 0.080:
+            raise ValueError(
+                f"CURVATURE_FIT_CONFLICT:"
+                f"residual={residual:.3f}m;"
+                f"s_from_first={center - start:.3f}m"
+            )
+        
+        dx, dy = coefficients[1]
+        ddx, ddy = 2.0 * coefficients[2]
+        tangent_norm = math.hypot(float(dx), float(dy))
+
+        safe_tangent = max(tangent_norm, 0.30)
+        
+        curvature = float(
+            (dx * ddy - dy * ddx) / safe_tangent ** 3
+        )
+        if not math.isfinite(curvature):
+            raise ValueError("CURVATURE_NONFINITE")
+
+        estimates.append(abs(curvature))
+        residuals.append(residual)
+        locations.append(float(center - start))
+
+    if not estimates:
+        raise ValueError("CURVATURE_NO_USABLE_FIT")
+
+    peak = int(np.argmax(estimates))
+    kappa = estimates[peak]
+
+    limit = v_max
+    if kappa >= 1e-3:
+        limit = min(
+            v_max,
+            math.sqrt(a_lat / kappa),
+            max_w / kappa,
+        )
+
+    diagnostics = {
+        "peak_s_from_first_m": locations[peak],
+        "max_fit_residual_m": max(residuals),
+    }
+    return float(limit), float(kappa), diagnostics
 
 
 class MetricMPC(Node):
     def __init__(self):
         super().__init__("metric_mpc_controller")
         
-        self.declare_parameter("max_v", 0.20)
+        self.declare_parameter("max_v", 0.23)
 
         self.request_pub = self.create_publisher(
             Twist, "/cmd_vel_request", 10
@@ -154,18 +241,20 @@ class MetricMPC(Node):
         self.last_log_time    = 0.0
 
         self.last_good_command_time = None
-        self.max_reference_loss_s   = 0.40
+        self.loss_started = None
+        self.loss_initial_command = np.zeros(2)
+        self.max_reference_loss_s = 0.70
         
         self.a_lat = 0.35
         self.dt = 0.10
         self.n  = 8
         self.max_v   = float(self.get_parameter("max_v").value)
-        self.max_w   = 0.45
-        self.max_dv  = 0.05
-        self.loss_dv = 0.05      
-        self.max_dw  = 0.08
-        self.max_frame_age  = 0.22
+        self.max_w   = 0.43
+        self.max_dv  = 0.05      
+        self.max_dw  = 0.07
+        self.max_frame_age  = 0.45
         self.max_solve_time = 0.15
+        
 
         self.create_timer(self.dt, self.tick)
         self.get_logger().warn(
@@ -225,29 +314,35 @@ class MetricMPC(Node):
             
     def slow_for_missing_reference(self, reason):
         now = time.monotonic()
-        previous_v, previous_w = map(float, self.previous_command)
 
-        if (self.last_good_command_time is None
-            or now - self.last_good_command_time
-            >= self.max_reference_loss_s):
+        if self.last_good_command_time is None:
             self.stop(reason)
             return
 
-        v = max(0.0, previous_v - self.loss_dv)
+        if self.loss_started is None:
+            self.loss_started = now
+            self.loss_initial_command = self.previous_command.copy()
 
-        # Reduce turning with speed rather than repeatedly switching
-        # between the last steering command and zero.
-        if v <= 1e-6 or previous_v <= 1e-6:
-            w = 0.0
-        else:
-            desired_w = previous_w * (v / previous_v)
-            w = float(np.clip(desired_w,
-                previous_w - self.max_dw,
-                previous_w + self.max_dw,))
+        elapsed = now - self.loss_started
+
+        if elapsed >= self.max_reference_loss_s:
+            self.stop(reason)
+            return
+
+        # Begin reducing on the first failed tick. Speed and turning
+        # fade together from the command at the start of this loss.
+        fraction = max(
+            0.0,
+            1.0 - (elapsed + self.dt) / self.max_reference_loss_s,
+        )
+
+        v = float(self.loss_initial_command[0] * fraction)
+        w = float(self.loss_initial_command[1] * fraction)
 
         cmd = Twist()
         cmd.linear.x = v
         cmd.angular.z = w
+
         self.previous_command[:] = (v, w)
         self.request_pub.publish(cmd)
         self.report("DECELERATING", reason, v, w)
@@ -269,23 +364,37 @@ class MetricMPC(Node):
             self.get_clock().now().nanoseconds - stamp
         ) / 1e9
 
+        arrival_age = now - self.last_arrival
         if (
-            now - self.last_arrival > self.max_frame_age
+            arrival_age > self.max_frame_age
             or age < -0.05
             or age > self.max_frame_age
         ):
-            self.slow_for_missing_reference("STALE_REFERENCE")
+            self.slow_for_missing_reference(
+                f"STALE_REFERENCE:"
+                f"source_age={age:.3f}s;"
+                f"arrival_age={arrival_age:.3f}s;"
+                f"limit={self.max_frame_age:.3f}s"
+            )
             return
 
         try:
             path, s, headings, observed_arc = prepare_path(source)
-        except (ValueError, KeyError, TypeError) as exc:
-            self.stop(str(exc))
+
+            curve_limit, kappa, curvature_debug = curvature_speed(
+                path, s, self.max_v, self.a_lat, self.max_w
+            )
+        except (ValueError, KeyError, TypeError, np.linalg.LinAlgError) as exc:
+            self.slow_for_missing_reference(str(exc))
             return
 
-        # Velocity calculation
-        curve_limit, kappa = curvature_speed(
-            s, headings, self.max_v, self.a_lat, self.max_w
+        coverage_limit = max(
+            0.0,
+            (observed_arc - 0.06) / (self.n * self.dt),
+        )
+
+        target_v = min(
+            self.max_v, curve_limit, coverage_limit
         )
         
         coverage_limit = max(
@@ -412,7 +521,12 @@ class MetricMPC(Node):
             "MPC_REQUEST",
             f"arc={observed_arc:.3f}m; "
             f"kappa={kappa:.2f}; "
+            f"peak_s={curvature_debug['peak_s_from_first_m']:.3f}m; "
+            f"fit_err={curvature_debug['max_fit_residual_m']:.4f}m; "
+            f"curve_limit={curve_limit:.3f}; "
+            f"coverage_limit={coverage_limit:.3f}; "
             f"target_v={target_v:.3f}; "
+            f"source_age_start={age:.3f}s; "
             f"solve={solve_time:.3f}s; "
             f"source={source['status']}",
             cmd.linear.x,

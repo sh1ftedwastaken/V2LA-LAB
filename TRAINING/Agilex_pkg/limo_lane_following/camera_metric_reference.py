@@ -198,12 +198,8 @@ class CameraMetricReference(Node):
         self.homography = cv2.getPerspectiveTransform(SRC, DST)
         self.inverse_homography = np.linalg.inv(self.homography)
 
-        # This is a measured/default width, not evidence of which
-        # side of a solitary marking contains the intended corridor.
-        self.declare_parameter("lane_width_m", 0.39)
 
-        # Only for a cold start when a SINGLE boundary is visible
-        # and its corridor role is independently known.
+        self.declare_parameter("lane_width_m", 0.39)
         self.declare_parameter("single_boundary_side", "unknown")
 
         self.learned_width_m = None
@@ -359,9 +355,9 @@ class CameraMetricReference(Node):
 
                 if len(widths) < 4:
                     continue
-
-                width = float(np.median(widths))
-                deviation = float(np.median(
+                
+                width = float(np.mean(widths))
+                deviation = float(np.mean(
                     np.abs(np.asarray(widths) - width)
                 ))
                 if not (0.27 <= width <= 0.52):
