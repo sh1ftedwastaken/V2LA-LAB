@@ -207,21 +207,23 @@ class CameraMetricReference(Node):
         self.previous_traces = {"left": None, "right": None}
         self.previous_time = None
         self.corridor_established = False
+        
+        self.last_valid_time = time.monotonic()
+        self.corridor_reset_timeout_s = 2.0
 
         self.debug_pub = self.create_publisher(
-            Image, "/lane/camera_reference_debug", 10
+            Image, "/lane/camera_reference_debug", 2
         )
         self.data_pub = self.create_publisher(
             String, "/lane/metric_reference_debug", 10
         )
         self.reference_pub = self.create_publisher(
-    String, "/lane/metric_reference", 10
+            String, "/lane/metric_reference", 3
         )
         self.create_subscription(
             Image, "/seg/mask_raw", self.on_mask, 10
         )
         
-
         self.get_logger().info(
             "Corridor-associated reference diagnostic active; "
             "no motion commands."
@@ -374,14 +376,17 @@ class CameraMetricReference(Node):
                 if near_center[0] > 0.65:
                     continue
 
-                # If roles were learned from an established pair,
-                # do not reverse their color identities.
-                if self.role_colors["left"] is not None:
-                    if left["color"] != self.role_colors["left"]:
-                        continue
-                if self.role_colors["right"] is not None:
-                    if right["color"] != self.role_colors["right"]:
-                        continue
+                # Allow a well-centered pair near the bumper to re-establish roles
+                # if recent tracking match is lost
+                is_centered_near = (near_center[0] <= 0.42 and abs(float(near_center[1])) <= 0.12)
+                
+                if not is_centered_near:
+                    if self.role_colors["left"] is not None:
+                        if left["color"] != self.role_colors["left"]:
+                            continue
+                    if self.role_colors["right"] is not None:
+                        if right["color"] != self.role_colors["right"]:
+                            continue
 
                 left_error = self.remembered_error(
                     left, "left", now
@@ -550,6 +555,13 @@ class CameraMetricReference(Node):
             )
             for row in pair["shared_rows"]
         }
+        
+    def reset_corridor(self, reason="TIMEOUT"):
+        self.get_logger().info(f"Resetting corridor roles: {reason}")
+        self.role_colors = {"left": None, "right": None}
+        self.previous_traces = {"left": None, "right": None}
+        self.corridor_established = False
+        self.previous_time = None
 
     def validate_path(self, mask, centers, debug, result):
         """Keep a connected, observed prefix; never bridge a jump."""
@@ -742,6 +754,7 @@ class CameraMetricReference(Node):
         )
 
         now = time.monotonic()
+        
         requested_side = str(
             self.get_parameter("single_boundary_side").value
         ).lower()
@@ -749,6 +762,9 @@ class CameraMetricReference(Node):
             "left", "right", "unknown"
         ):
             requested_side = "unknown"
+            
+        if self.corridor_established and (now - self.last_valid_time > self.corridor_reset_timeout_s):
+            self.reset_corridor("TRACK_LOST_TIMEOUT")
 
         pairs = self.pair_candidates(traces, now)
         singles = self.single_candidates(
@@ -883,6 +899,8 @@ class CameraMetricReference(Node):
         if accepted:
             # Only a verified pair establishes/re-establishes both
             # boundary roles and teaches the current width.
+            self.last_valid_time = now
+
             if pair is not None:
                 if pair["left"]["color"] != pair["right"]["color"]:
                     self.role_colors = {

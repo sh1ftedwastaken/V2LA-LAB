@@ -92,7 +92,7 @@ def prepare_path(source):
     first = points[0]
     if (
         first[0] < 0.08 or first[0] > 0.45
-        or abs(first[1]) > 0.18
+        or abs(first[1]) > 0.25
     ):
         raise ValueError("UNSUPPORTED_NEAR_GAP")
 
@@ -249,9 +249,9 @@ class MetricMPC(Node):
         self.dt = 0.10
         self.n  = 8
         self.max_v   = float(self.get_parameter("max_v").value)
-        self.max_w   = 0.43
-        self.max_dv  = 0.05      
-        self.max_dw  = 0.07
+        self.max_w   = 0.45
+        self.max_dv  = 0.05    
+        self.max_dw  = 0.08
         self.max_frame_age  = 0.45
         self.max_solve_time = 0.15
         

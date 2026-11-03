@@ -64,7 +64,7 @@ class SafetySupervisor(Node):
 
         # Require at least one measurable front reading. Do not
         # interpret an absent or entirely unreadable scan as clear.
-        self.front_clear = bool(front) and min(front) >= 0.35
+        self.front_clear = bool(front) and min(front) >= 0.30
 
     def tick(self):
         now = time.monotonic()
